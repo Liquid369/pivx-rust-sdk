@@ -20,7 +20,10 @@ pub type ImplTxProver = (MockOutputProver, MockSpendProver);
 
 static PROVER: OnceCell<ImplTxProver> = OnceCell::const_new();
 
+// Used by the real prover; the test build swaps in a mock and doesn't read these.
+#[cfg_attr(test, allow(dead_code))]
 const OUTPUT_SHA256: &str = "2f0ebbcbb9bb0bcffe95a397e7eba89c29eb4dde6191c339db88570e3f3fb0e4";
+#[cfg_attr(test, allow(dead_code))]
 const SPEND_SHA256: &str = "8e48ffd23abb3a5fd9c5589204f32d9c31285a04b78096ba40a79b75677efc13";
 const DEFAULT_URLS: &[&str] = &["https://pivxla.bz", "https://duddino.com"];
 
@@ -48,8 +51,18 @@ pub async fn load_prover_from_url(url: &str) -> Result<(), Box<dyn Error>> {
     PROVER
         .get_or_try_init(|| async {
             let c = reqwest::Client::new();
-            let output = c.get(format!("{url}/sapling-output.params")).send().await?.bytes().await?;
-            let spend = c.get(format!("{url}/sapling-spend.params")).send().await?.bytes().await?;
+            let output = c
+                .get(format!("{url}/sapling-output.params"))
+                .send()
+                .await?
+                .bytes()
+                .await?;
+            let spend = c
+                .get(format!("{url}/sapling-spend.params"))
+                .send()
+                .await?
+                .bytes()
+                .await?;
             check_and_create_prover(&output, &spend)
         })
         .await?;
@@ -69,7 +82,9 @@ pub async fn load_prover_from_bytes(
     sapling_spend_bytes: &[u8],
 ) -> Result<(), Box<dyn Error>> {
     PROVER
-        .get_or_try_init(|| async { check_and_create_prover(sapling_output_bytes, sapling_spend_bytes) })
+        .get_or_try_init(|| async {
+            check_and_create_prover(sapling_output_bytes, sapling_spend_bytes)
+        })
         .await?;
     Ok(())
 }

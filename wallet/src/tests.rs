@@ -10,7 +10,10 @@ use pivx_primitives::consensus::Network::TestNetwork;
 const BIRTH: i64 = 100;
 
 fn fixture_block() -> Vec<WalletBlock> {
-    vec![WalletBlock { height: BIRTH + 1, tx_hexes: vec![TX_HEX.to_string()] }]
+    vec![WalletBlock {
+        height: BIRTH + 1,
+        tx_hexes: vec![TX_HEX.to_string()],
+    }]
 }
 
 #[test]
@@ -40,10 +43,28 @@ fn scans_real_tx_into_spendable_note() {
     assert_eq!(attributed.value, 1_000_000_000);
 }
 
+#[test]
+fn handle_blocks_keeps_notes_when_scan_fails() {
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.handle_blocks(&fixture_block()).unwrap();
+    assert_eq!(wallet.notes().len(), 1);
+
+    // A v3-prefixed but malformed tx hex makes the scan fail. The tracked
+    // note must survive the error, not be silently dropped.
+    let bad = vec![WalletBlock {
+        height: BIRTH + 2,
+        tx_hexes: vec!["03zzzz".into()],
+    }];
+    assert!(wallet.handle_blocks(&bad).is_err());
+    assert_eq!(wallet.notes().len(), 1, "notes preserved on scan failure");
+    assert_eq!(wallet.balance(), 1_000_000_000);
+}
+
 #[tokio::test]
 async fn watch_only_scans_but_cannot_spend() {
     let extsk = keys::decode_extsk(EXTSK, TestNetwork).unwrap();
-    let extfvk = keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
+    let extfvk =
+        keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
 
     let mut watch = ShieldWallet::from_viewing_key(&extfvk, TestNetwork, BIRTH).unwrap();
     assert!(!watch.can_spend());
@@ -86,10 +107,13 @@ fn save_load_round_trip_excludes_spending_key() {
 /// Upstream test_create_transaction, on our native API (MockProver).
 #[tokio::test]
 async fn builds_transaction_with_expected_nullifier() {
-    crate::prover::load_prover_from_bytes(&[], &[]).await.unwrap();
+    crate::prover::load_prover_from_bytes(&[], &[])
+        .await
+        .unwrap();
 
     let extsk = keys::decode_extsk(TX2_EXTSK, TestNetwork).unwrap();
-    let extfvk = keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
+    let extfvk =
+        keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
 
     // scan the input tx from the fixture tree to obtain the note + witness
     let scan = transaction::scan_transactions(
@@ -125,9 +149,12 @@ async fn builds_transaction_with_expected_nullifier() {
 /// Fee must not be silently taken from the recipient unless opted in.
 #[tokio::test]
 async fn refuses_silent_fee_subtraction() {
-    crate::prover::load_prover_from_bytes(&[], &[]).await.unwrap();
+    crate::prover::load_prover_from_bytes(&[], &[])
+        .await
+        .unwrap();
     let extsk = keys::decode_extsk(TX2_EXTSK, TestNetwork).unwrap();
-    let extfvk = keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
+    let extfvk =
+        keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
     let scan = transaction::scan_transactions(
         TX2_TREE,
         &[TX2_INPUT_TX.to_string()],
@@ -162,7 +189,9 @@ async fn refuses_silent_fee_subtraction() {
 /// Zero amount and oversized memo are rejected up front.
 #[tokio::test]
 async fn rejects_zero_amount_and_oversized_memo() {
-    crate::prover::load_prover_from_bytes(&[], &[]).await.unwrap();
+    crate::prover::load_prover_from_bytes(&[], &[])
+        .await
+        .unwrap();
     let extsk = keys::decode_extsk(TX2_EXTSK, TestNetwork).unwrap();
     let base = |amount, memo: String| TxOptions {
         notes: Some(vec![]),
@@ -176,24 +205,38 @@ async fn rejects_zero_amount_and_oversized_memo() {
         memo,
         subtract_fee_from_amount: false,
     };
-    assert!(transaction::create_transaction(base(0, String::new())).await.is_err());
-    assert!(transaction::create_transaction(base(1, "x".repeat(513))).await.is_err());
+    assert!(transaction::create_transaction(base(0, String::new()))
+        .await
+        .is_err());
+    assert!(transaction::create_transaction(base(1, "x".repeat(513)))
+        .await
+        .is_err());
 }
 
 /// End-to-end through the wallet: scan then build a spend (MockProver).
 #[tokio::test]
 async fn wallet_creates_and_finalizes_spend() {
-    crate::prover::load_prover_from_bytes(&[], &[]).await.unwrap();
+    crate::prover::load_prover_from_bytes(&[], &[])
+        .await
+        .unwrap();
 
     let mut wallet = ShieldWallet::from_spending_key(TX2_EXTSK, TestNetwork, BIRTH).unwrap();
     // seed the wallet's tree with the fixture tree so witnesses line up
     wallet_set_tree_for_test(&mut wallet, TX2_TREE);
-    wallet.handle_blocks(&[WalletBlock { height: BIRTH + 1, tx_hexes: vec![TX2_INPUT_TX.to_string()] }]).unwrap();
+    wallet
+        .handle_blocks(&[WalletBlock {
+            height: BIRTH + 1,
+            tx_hexes: vec![TX2_INPUT_TX.to_string()],
+        }])
+        .unwrap();
     let balance_before = wallet.balance();
     assert!(balance_before > 0);
 
     let built = wallet
-        .create_transaction(&SendOptions::shield("yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D", 5 * 10e6 as u64))
+        .create_transaction(&SendOptions::shield(
+            "yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D",
+            5 * 10e6 as u64,
+        ))
         .await
         .unwrap();
 
@@ -202,7 +245,10 @@ async fn wallet_creates_and_finalizes_spend() {
     wallet.discard_transaction(&built.txid);
     assert_eq!(wallet.balance(), balance_before);
     let built = wallet
-        .create_transaction(&SendOptions::shield("yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D", 5 * 10e6 as u64))
+        .create_transaction(&SendOptions::shield(
+            "yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D",
+            5 * 10e6 as u64,
+        ))
         .await
         .unwrap();
     wallet.finalize_transaction(&built.txid);

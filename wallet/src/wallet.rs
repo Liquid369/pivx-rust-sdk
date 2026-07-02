@@ -248,12 +248,15 @@ impl ShieldWallet {
             .iter()
             .flat_map(|b| b.tx_hexes.iter().cloned())
             .collect();
+        // Clone rather than move the notes out: if the scan fails (bad tx hex
+        // from the node, corrupt witness in loaded state), `?` returns before
+        // we reassign, and `self.notes` must be left intact for the caller.
         let result = transaction::scan_transactions(
             &self.commitment_tree,
             &tx_hexes,
             &self.extfvk,
             self.network,
-            std::mem::take(&mut self.notes),
+            self.notes.clone(),
         )?;
 
         self.commitment_tree = result.commitment_tree;
@@ -508,6 +511,7 @@ mod rpc_sync {
                     }
                     let mut probe = self.last_processed_block - 1;
                     let mut last_cp = self.last_processed_block;
+                    let mut adopted = false;
                     while probe > 0 {
                         let (cp_h, cp_tree) = get_checkpoint(probe as i32, self.network);
                         let cp_h = cp_h as i64;
@@ -520,9 +524,19 @@ mod rpc_sync {
                         if node_root.is_none() || node_root.as_deref() == Some(cp_root.as_str()) {
                             self.commitment_tree = cp_tree.to_string();
                             self.last_processed_block = cp_h;
+                            adopted = true;
                             break;
                         }
                         probe = cp_h - 1;
+                    }
+                    // No bundled checkpoint matched the node: do not proceed on
+                    // an unconfirmed tree. Surface it rather than "validating".
+                    if !adopted {
+                        return Err(WalletError::ScanDiverged {
+                            height: self.last_processed_block,
+                            local,
+                            node: n,
+                        });
                     }
                 }
             }
@@ -549,6 +563,15 @@ mod rpc_sync {
                 for h in from..=to {
                     let hash = client.get_block_hash(h).await?;
                     let block = client.get_block(&hash, 2).await?;
+                    // Trust the height we asked for, not the one the node
+                    // echoes, and reject a mismatch — otherwise a lying node
+                    // can fast-forward last_processed_block past real deposits.
+                    if block["height"].as_i64() != Some(h) {
+                        return Err(WalletError::Other(format!(
+                            "node returned block height {:?} for requested height {h}",
+                            block["height"].as_i64()
+                        )));
+                    }
                     // A tx object without "hex" is malformed: fail rather than
                     // silently dropping it (dropping desyncs the tree).
                     let tx_hexes = block["tx"]

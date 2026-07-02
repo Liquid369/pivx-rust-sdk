@@ -40,6 +40,7 @@ on crates.io. **Do not delete `Cargo.lock`** — it pins `core2 0.3.x`, which
 is yanked upstream.
 
 Full usage guide: [docs/usage.md](docs/usage.md).
+Feature list: [docs/FEATURES.md](docs/FEATURES.md). Deployment + safety: [docs/deployment.md](docs/deployment.md), [SECURITY.md](SECURITY.md).
 
 ## Develop
 

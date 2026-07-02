@@ -8,9 +8,7 @@ use crate::checkpoint::get_checkpoint;
 use crate::error::{Result, WalletError};
 use crate::keys;
 use crate::prover;
-use crate::transaction::{
-    self, sapling_root, BuiltTransaction, SerializedNote, TxOptions, Utxo,
-};
+use crate::transaction::{self, sapling_root, BuiltTransaction, SerializedNote, TxOptions, Utxo};
 
 /// A block to scan: raw tx hexes plus the block height.
 pub struct WalletBlock {
@@ -47,7 +45,13 @@ pub struct SendOptions {
 impl SendOptions {
     /// A shield send of `amount` sats to `to`, no memo, fee paid by the sender.
     pub fn shield(to: impl Into<String>, amount: u64) -> Self {
-        Self { to: to.into(), amount, memo: None, inputs: Inputs::Shield, subtract_fee_from_amount: false }
+        Self {
+            to: to.into(),
+            amount,
+            memo: None,
+            inputs: Inputs::Shield,
+            subtract_fee_from_amount: false,
+        }
     }
 }
 
@@ -99,12 +103,19 @@ pub struct ShieldWallet {
     nullifier_map: HashMap<String, AttributedNote>,
     /// txid → nullifiers awaiting broadcast confirmation.
     pending_spends: HashMap<String, Vec<String>>,
+    /// Whether the starting checkpoint has been confirmed against the node.
+    start_validated: bool,
 }
 
 impl ShieldWallet {
     /// Full-capability wallet from 32 bytes of seed entropy (ZIP32, PIVX
     /// coin type). Scanning starts at the checkpoint nearest `birth_height`.
-    pub fn from_seed(seed: &[u8; 32], network: Network, birth_height: i64, account_index: u32) -> Result<Self> {
+    pub fn from_seed(
+        seed: &[u8; 32],
+        network: Network,
+        birth_height: i64,
+        account_index: u32,
+    ) -> Result<Self> {
         let extsk = keys::spending_key_from_seed(seed, network, account_index)?;
         Self::from_parts(Some(extsk), None, network, birth_height)
     }
@@ -133,25 +144,32 @@ impl ShieldWallet {
             (Some(sk), None) => keys::extfvk_from_extsk(sk),
             (None, None) => unreachable!("constructors always pass a key"),
         };
-        let (_, checkpoint_tree) = get_checkpoint(birth_height as i32, network);
+        // Resume from the checkpoint's own height, not birth_height: the tree
+        // is the committed state AT the checkpoint, so scanning must start at
+        // checkpoint_height + 1. Starting higher would leave the tree missing
+        // every shield output in the gap and diverge on the first real block.
+        let (checkpoint_height, checkpoint_tree) = get_checkpoint(birth_height as i32, network);
         let (_, diversifier_index) = keys::default_address(&extfvk, network);
         Ok(Self {
             network,
             extsk,
             extfvk,
             commitment_tree: checkpoint_tree.to_string(),
-            last_processed_block: birth_height,
+            last_processed_block: checkpoint_height as i64,
             diversifier_index,
             notes: vec![],
             nullifier_map: HashMap::new(),
             pending_spends: HashMap::new(),
+            start_validated: false,
         })
     }
 
     /// Upgrade a watch-only wallet. The key must match the stored viewing key.
     pub fn load_spending_key(&mut self, enc_extsk: &str) -> Result<()> {
         if self.extsk.is_some() {
-            return Err(WalletError::InvalidKey("wallet already has a spending key".into()));
+            return Err(WalletError::InvalidKey(
+                "wallet already has a spending key".into(),
+            ));
         }
         let extsk = keys::decode_extsk(enc_extsk, self.network)?;
         if keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), self.network)
@@ -178,7 +196,8 @@ impl ShieldWallet {
 
     /// Next diversified shield receive address.
     pub fn new_address(&mut self) -> Result<String> {
-        let (address, index) = keys::next_address(&self.extfvk, self.diversifier_index, self.network)?;
+        let (address, index) =
+            keys::next_address(&self.extfvk, self.diversifier_index, self.network)?;
         self.diversifier_index = index;
         Ok(address)
     }
@@ -220,10 +239,15 @@ impl ShieldWallet {
             }
             prev = b.height;
         }
-        let Some(last) = blocks.last() else { return Ok(vec![]) };
+        let Some(last) = blocks.last() else {
+            return Ok(vec![]);
+        };
         let last_height = last.height;
 
-        let tx_hexes: Vec<String> = blocks.iter().flat_map(|b| b.tx_hexes.iter().cloned()).collect();
+        let tx_hexes: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| b.tx_hexes.iter().cloned())
+            .collect();
         let result = transaction::scan_transactions(
             &self.commitment_tree,
             &tx_hexes,
@@ -239,7 +263,10 @@ impl ShieldWallet {
                 .unwrap_or_default();
             self.nullifier_map.insert(
                 n.nullifier.clone(),
-                AttributedNote { recipient: addr, value: n.note.value().inner() },
+                AttributedNote {
+                    recipient: addr,
+                    value: n.note.value().inner(),
+                },
             );
         }
         let spent: HashSet<&String> = result.spent_nullifiers.iter().collect();
@@ -286,9 +313,10 @@ impl ShieldWallet {
                     .collect();
                 (Some(spendable), None, self.new_address()?)
             }
-            Inputs::Transparent { utxos, change_address } => {
-                (None, Some(utxos.clone()), change_address.clone())
-            }
+            Inputs::Transparent {
+                utxos,
+                change_address,
+            } => (None, Some(utxos.clone()), change_address.clone()),
         };
         let extsk = self.extsk.as_ref().expect("checked above");
 
@@ -307,7 +335,8 @@ impl ShieldWallet {
         .await?;
 
         if matches!(opts.inputs, Inputs::Shield) {
-            self.pending_spends.insert(built.txid.clone(), built.nullifiers.clone());
+            self.pending_spends
+                .insert(built.txid.clone(), built.nullifiers.clone());
         }
         Ok(built)
     }
@@ -376,12 +405,13 @@ impl ShieldWallet {
             notes: state.notes,
             nullifier_map: state.nullifier_map,
             pending_spends: state.pending_spends,
+            start_validated: false,
         })
     }
 
     /// Reset scan state to the checkpoint at or below `height` and drop all
-    /// tracked notes. The documented recovery from `WalletError::ScanDiverged`:
-    /// call this, then re-sync. Requires no keys.
+    /// tracked notes. This is the recovery path after a divergence error:
+    /// call it, then re-sync. It needs no keys.
     pub fn reload_from_checkpoint(&mut self, height: i64) {
         let (cp_height, cp_tree) = get_checkpoint(height as i32, self.network);
         self.commitment_tree = cp_tree.to_string();
@@ -389,6 +419,7 @@ impl ShieldWallet {
         self.notes.clear();
         self.nullifier_map.clear();
         self.pending_spends.clear();
+        self.start_validated = false;
     }
 }
 
@@ -404,11 +435,78 @@ mod rpc_sync {
     use super::*;
     use pivx_rpc::PivxClient;
 
+    /// The node's `finalsaplingroot` at height `h`, or None below shield
+    /// activation / when the node omits it.
+    async fn node_sapling_root(client: &PivxClient, h: i64) -> Result<Option<String>> {
+        if h <= 0 {
+            return Ok(None);
+        }
+        let hash = client.get_block_hash(h).await?;
+        let block = client.get_block(&hash, 1).await?;
+        Ok(block["finalsaplingroot"].as_str().map(String::from))
+    }
+
+    /// Root of a checkpoint tree in the node's display byte order.
+    fn reversed_root(tree_hex: &str) -> Result<String> {
+        let natural = transaction::sapling_root(tree_hex)?;
+        let mut bytes = hex::decode(&natural).map_err(|e| WalletError::Other(e.to_string()))?;
+        bytes.reverse();
+        Ok(hex::encode(bytes))
+    }
+
     impl ShieldWallet {
+        /// Confirm the starting commitment tree against the node before
+        /// scanning forward. A fresh wallet begins at a bundled checkpoint;
+        /// if that checkpoint's tree does not match the node's sapling root
+        /// at that height (some near-tip checkpoints are captured on stale
+        /// blocks), walk back to the newest checkpoint the node confirms. A
+        /// wallet that already holds scanned notes and no longer matches is
+        /// treated as diverged rather than silently rewound.
+        async fn ensure_valid_checkpoint(&mut self, client: &PivxClient) -> Result<()> {
+            if self.start_validated {
+                return Ok(());
+            }
+            let local = reversed_root(&self.commitment_tree)?;
+            match node_sapling_root(client, self.last_processed_block).await? {
+                None => {}
+                Some(n) if n == local => {}
+                Some(n) => {
+                    if !self.notes.is_empty() || !self.pending_spends.is_empty() {
+                        return Err(WalletError::ScanDiverged {
+                            height: self.last_processed_block,
+                            local,
+                            node: n,
+                        });
+                    }
+                    let mut probe = self.last_processed_block - 1;
+                    let mut last_cp = self.last_processed_block;
+                    while probe > 0 {
+                        let (cp_h, cp_tree) = get_checkpoint(probe as i32, self.network);
+                        let cp_h = cp_h as i64;
+                        if cp_h >= last_cp {
+                            break; // no older checkpoint available
+                        }
+                        last_cp = cp_h;
+                        let node_root = node_sapling_root(client, cp_h).await?;
+                        let cp_root = reversed_root(cp_tree)?;
+                        if node_root.is_none() || node_root.as_deref() == Some(cp_root.as_str()) {
+                            self.commitment_tree = cp_tree.to_string();
+                            self.last_processed_block = cp_h;
+                            break;
+                        }
+                        probe = cp_h - 1;
+                    }
+                }
+            }
+            self.start_validated = true;
+            Ok(())
+        }
+
         /// Sync from the node to its tip, verifying the local tree against
         /// the node's `finalsaplingroot` each batch.
         pub async fn sync(&mut self, client: &PivxClient, batch_size: i64) -> Result<()> {
             let tip = client.get_block_count().await?;
+            self.ensure_valid_checkpoint(client).await?;
             while self.last_processed_block < tip {
                 let from = self.last_processed_block + 1;
                 let to = (from + batch_size - 1).min(tip);
@@ -424,14 +522,16 @@ mod rpc_sync {
                         .ok_or_else(|| WalletError::Other(format!("block {h} has no tx array")))?
                         .iter()
                         .map(|t| {
-                            t["hex"]
-                                .as_str()
-                                .map(String::from)
-                                .ok_or_else(|| WalletError::Other(format!("block {h} has a tx without hex")))
+                            t["hex"].as_str().map(String::from).ok_or_else(|| {
+                                WalletError::Other(format!("block {h} has a tx without hex"))
+                            })
                         })
                         .collect::<Result<Vec<_>>>()?;
                     node_root = block["finalsaplingroot"].as_str().map(String::from);
-                    blocks.push(WalletBlock { height: h, tx_hexes });
+                    blocks.push(WalletBlock {
+                        height: h,
+                        tx_hexes,
+                    });
                 }
 
                 // Snapshot so a failed root check can't leave partial state.
@@ -446,11 +546,16 @@ mod rpc_sync {
                     // A shielded chain always reports a sapling root; a missing
                     // one means the node is lying or pre-activation. Refuse to
                     // advance unverified rather than skipping the only check.
-                    let node_root = node_root
-                        .ok_or_else(|| WalletError::Other(format!("node omitted finalsaplingroot at height {to}")))?;
+                    let node_root = node_root.ok_or_else(|| {
+                        WalletError::Other(format!("node omitted finalsaplingroot at height {to}"))
+                    })?;
                     let local = self.sapling_root()?;
                     if local != node_root {
-                        return Err(WalletError::ScanDiverged { height: to, local, node: node_root });
+                        return Err(WalletError::ScanDiverged {
+                            height: to,
+                            local,
+                            node: node_root,
+                        });
                     }
                     Ok(())
                 })();

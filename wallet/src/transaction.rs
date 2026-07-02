@@ -1,9 +1,9 @@
 //! Shielded scanning and transaction building.
 //!
 //! Adapted from PIVX-Labs/pivx-shield `src/transaction.rs` (MIT): wasm-bindgen
-//! shims removed, native types throughout, single-threaded proving
-//! (ponytail: enable pivx_proofs/multicore + a rayon build path if server
-//! proving latency ever matters).
+//! shims removed, native types throughout, single-threaded proving. If server
+//! proving latency ever matters, enable pivx_proofs/multicore and add a rayon
+//! build path.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -93,7 +93,9 @@ pub fn read_commitment_tree(tree_hex: &str) -> Result<CommitmentTree<Node, DEPTH
     Ok(zcash_read_commitment_tree(buff)?)
 }
 
-pub fn commitment_tree_to_hex(tree: &CommitmentTree<Node, DEPTH>) -> Result<String, Box<dyn Error>> {
+pub fn commitment_tree_to_hex(
+    tree: &CommitmentTree<Node, DEPTH>,
+) -> Result<String, Box<dyn Error>> {
     let mut buff = Vec::new();
     write_commitment_tree(tree, &mut buff)?;
     Ok(hex::encode(buff))
@@ -105,7 +107,9 @@ pub fn sapling_root(tree_hex: &str) -> Result<String, WalletError> {
     use pivx_primitives::merkle_tree::HashSer;
     let tree = read_commitment_tree(tree_hex).map_err(WalletError::from)?;
     let mut root = Vec::new();
-    tree.root().write(&mut root).map_err(|e| WalletError::Other(e.to_string()))?;
+    tree.root()
+        .write(&mut root)
+        .map_err(|e| WalletError::Other(e.to_string()))?;
     Ok(hex::encode(root))
 }
 
@@ -152,19 +156,38 @@ pub fn scan_transactions(
     let mut wallet_transactions = vec![];
 
     for hex_tx in tx_hexes {
+        // Only version-3 transactions carry sapling data; skip the rest. They
+        // contribute nothing to the tree and the parser rejects some of them.
+        if !hex_tx.starts_with("03") {
+            continue;
+        }
         let tx = Transaction::read(
-            Cursor::new(hex::decode(hex_tx).map_err(|_| WalletError::Other("invalid tx hex".into()))?),
+            Cursor::new(
+                hex::decode(hex_tx).map_err(|_| WalletError::Other("invalid tx hex".into()))?,
+            ),
             BranchId::Sapling,
         )
         .map_err(|e| WalletError::Other(format!("cannot parse tx: {e}")))?;
-        let decrypted = decrypt_transaction(&network, BlockHeight::from_u32(DECRYPT_HEIGHT), &tx, &accounts);
+        let decrypted = decrypt_transaction(
+            &network,
+            BlockHeight::from_u32(DECRYPT_HEIGHT),
+            &tx,
+            &accounts,
+        );
 
         let old_note_count = new_notes.len();
-        let tx_nullifiers = handle_transaction(&mut tree, &tx, &decrypted, &nullif_key, &mut notes, &mut new_notes)
-            .map_err(WalletError::from)?
-            .into_iter()
-            .map(|n| hex::encode(n.0))
-            .collect::<Vec<_>>();
+        let tx_nullifiers = handle_transaction(
+            &mut tree,
+            &tx,
+            &decrypted,
+            &nullif_key,
+            &mut notes,
+            &mut new_notes,
+        )
+        .map_err(WalletError::from)?
+        .into_iter()
+        .map(|n| hex::encode(n.0))
+        .collect::<Vec<_>>();
 
         let is_wallet_tx = old_note_count != new_notes.len()
             || notes
@@ -187,7 +210,10 @@ pub fn scan_transactions(
 }
 
 fn serialize_notes(notes: Vec<SpendableNote>) -> Result<Vec<SerializedNote>, Box<dyn Error>> {
-    notes.into_iter().map(SpendableNote::into_serialized).collect()
+    notes
+        .into_iter()
+        .map(SpendableNote::into_serialized)
+        .collect()
 }
 
 /// Add a tx to the commitment tree, advance every witness, and collect any
@@ -209,8 +235,9 @@ pub fn handle_transaction(
         for (i, out) in sapling.shielded_outputs().iter().enumerate() {
             tree.append(Node::from_cmu(out.cmu()))
                 .map_err(|_| "Failed to add cmu to tree")?;
-            for &mut SpendableNote { ref mut witness, .. } in
-                witnesses.iter_mut().chain(new_witnesses.iter_mut())
+            for &mut SpendableNote {
+                ref mut witness, ..
+            } in witnesses.iter_mut().chain(new_witnesses.iter_mut())
             {
                 witness
                     .append(Node::from_cmu(out.cmu()))
@@ -297,17 +324,34 @@ pub struct TxOptions<'a> {
 
 /// Build and prove a transaction. Inputs are consumed smallest-first.
 pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransaction, WalletError> {
-    let TxOptions { notes, utxos, extsk, to_address, change_address, amount, block_height, network, memo, subtract_fee_from_amount } = options;
-    assert!(!(notes.is_some() && utxos.is_some()), "Notes and UTXOs were both provided");
+    let TxOptions {
+        notes,
+        utxos,
+        extsk,
+        to_address,
+        change_address,
+        amount,
+        block_height,
+        network,
+        memo,
+        subtract_fee_from_amount,
+    } = options;
+    assert!(
+        !(notes.is_some() && utxos.is_some()),
+        "Notes and UTXOs were both provided"
+    );
     if amount == 0 {
-        return Err(WalletError::Other("amount must be greater than zero".into()));
+        return Err(WalletError::Other(
+            "amount must be greater than zero".into(),
+        ));
     }
     if memo.len() > 512 {
         return Err(WalletError::Other("memo must be at most 512 bytes".into()));
     }
 
     let input = if let Some(notes) = notes {
-        let mut notes: Vec<(Note, String)> = notes.into_iter().map(|n| (n.note, n.witness)).collect();
+        let mut notes: Vec<(Note, String)> =
+            notes.into_iter().map(|n| (n.note, n.witness)).collect();
         notes.sort_by_key(|(note, _)| note.value().inner());
         Either::Left(notes)
     } else if let Some(mut utxos) = utxos {
@@ -343,13 +387,27 @@ struct TxInternalArgs<'a> {
     subtract_fee_from_amount: bool,
 }
 
-async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTransaction, WalletError> {
-    let TxInternalArgs { inputs, extsk, to_address, change_address, mut amount, block_height, network, memo, subtract_fee_from_amount } = args;
+async fn create_transaction_internal(
+    args: TxInternalArgs<'_>,
+) -> Result<BuiltTransaction, WalletError> {
+    let TxInternalArgs {
+        inputs,
+        extsk,
+        to_address,
+        change_address,
+        mut amount,
+        block_height,
+        network,
+        memo,
+        subtract_fee_from_amount,
+    } = args;
 
     let anchor = if let Either::Left(ref notes) = inputs {
         match notes.first() {
             Some((_, witness)) => {
-                let witness = Cursor::new(hex::decode(witness).map_err(|e| WalletError::Other(e.to_string()))?);
+                let witness = Cursor::new(
+                    hex::decode(witness).map_err(|e| WalletError::Other(e.to_string()))?,
+                );
                 let witness = read_incremental_witness::<Node, _, DEPTH>(witness)
                     .map_err(|e| WalletError::Other(e.to_string()))?;
                 Anchor::from_bytes(witness.root().to_bytes()).into_option()
@@ -402,7 +460,8 @@ async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTr
         )?,
     };
 
-    let amount = Zatoshis::from_u64(amount).map_err(|_| WalletError::Other("invalid amount".into()))?;
+    let amount =
+        Zatoshis::from_u64(amount).map_err(|_| WalletError::Other("invalid amount".into()))?;
     match decode_generic_address(network, to_address)? {
         GenericAddress::Transparent(x) => builder
             .add_transparent_output(&x, amount)
@@ -412,7 +471,9 @@ async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTr
                 None,
                 x,
                 amount,
-                Memo::from_str(&memo).map(|m| m.encode()).unwrap_or(MemoBytes::empty()),
+                Memo::from_str(&memo)
+                    .map(|m| m.encode())
+                    .unwrap_or(MemoBytes::empty()),
             )
             .map_err(|_| WalletError::Other("failed to add output".into()))?,
     }
@@ -429,8 +490,15 @@ async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTr
     }
 
     let prover = get_loaded_prover().ok_or(WalletError::ProverNotLoaded)?;
-    prove_transaction(builder, extsk.clone(), &transparent_signing_set, nullifiers, fee, prover)
-        .map_err(WalletError::from)
+    prove_transaction(
+        builder,
+        extsk.clone(),
+        &transparent_signing_set,
+        nullifiers,
+        fee,
+        prover,
+    )
+    .map_err(WalletError::from)
 }
 
 fn choose_utxos(
@@ -473,7 +541,12 @@ fn choose_utxos(
             .map_err(|_| WalletError::Other("failed to use utxo".into()))?;
         transparent_signing_set.add_key(key);
         transparent_input_count += 1;
-        fee = fee_calculator(transparent_input_count, transparent_output_count, 0, sapling_output_count);
+        fee = fee_calculator(
+            transparent_input_count,
+            transparent_output_count,
+            0,
+            sapling_output_count,
+        );
         total = total.saturating_add(utxo.amount);
         if total >= amount.saturating_add(fee) {
             break;
@@ -497,23 +570,33 @@ fn choose_notes(
     let mut sapling_input_count = 0;
     let mut fee = 0;
     for (note, witness) in notes {
-        let witness = Cursor::new(hex::decode(witness).map_err(|e| WalletError::Other(e.to_string()))?);
+        let witness =
+            Cursor::new(hex::decode(witness).map_err(|e| WalletError::Other(e.to_string()))?);
         let witness = read_incremental_witness::<Node, _, DEPTH>(witness)
             .map_err(|e| WalletError::Other(e.to_string()))?;
         builder
             .add_sapling_spend::<FeeRule>(
                 extsk.to_diversifiable_full_viewing_key().fvk().clone(),
                 note.clone(),
-                witness.path().ok_or_else(|| WalletError::Other("commitment tree is empty".into()))?,
+                witness
+                    .path()
+                    .ok_or_else(|| WalletError::Other("commitment tree is empty".into()))?,
             )
             .map_err(|_| WalletError::Other("failed to add sapling spend".into()))?;
         let nullifier = note.nf(
-            &extsk.to_diversifiable_full_viewing_key().to_nk(Scope::External),
+            &extsk
+                .to_diversifiable_full_viewing_key()
+                .to_nk(Scope::External),
             witness.witnessed_position().into(),
         );
         nullifiers.push(hex::encode(nullifier.to_vec()));
         sapling_input_count += 1;
-        fee = fee_calculator(0, transparent_output_count, sapling_input_count, sapling_output_count);
+        fee = fee_calculator(
+            0,
+            transparent_output_count,
+            sapling_input_count,
+            sapling_output_count,
+        );
         total = total.saturating_add(note.value().inner());
         if total >= amount.saturating_add(fee) {
             break;
@@ -534,7 +617,9 @@ fn finish_input_selection(
     fee: u64,
     subtract_fee_from_amount: bool,
 ) -> Result<Zatoshis, WalletError> {
-    let needed = amount.checked_add(fee).ok_or(WalletError::InsufficientBalance)?;
+    let needed = amount
+        .checked_add(fee)
+        .ok_or(WalletError::InsufficientBalance)?;
     if total < needed {
         if subtract_fee_from_amount && total >= *amount && *amount > fee {
             *amount -= fee;

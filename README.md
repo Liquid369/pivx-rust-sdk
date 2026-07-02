@@ -39,6 +39,8 @@ git dependencies, so install `pivx-wallet` via git until librustpivx lands
 on crates.io. **Do not delete `Cargo.lock`** — it pins `core2 0.3.x`, which
 is yanked upstream.
 
+Full usage guide: [docs/usage.md](docs/usage.md).
+
 ## Develop
 
 ```

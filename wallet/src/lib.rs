@@ -36,6 +36,7 @@ mod mainnet_checkpoints;
 mod prover;
 mod testnet_checkpoints;
 mod transaction;
+mod transparent;
 mod wallet;
 
 #[cfg(test)]
@@ -48,12 +49,16 @@ pub use pivx_primitives::consensus::Network;
 pub use checkpoint::get_checkpoint;
 pub use error::{Result, WalletError};
 pub use keys::{
-    coin_type, decode_extsk, decode_extended_full_viewing_key, default_address, encode_extsk,
-    encode_extended_full_viewing_key, next_address, spending_key_from_seed,
+    coin_type, decode_extended_full_viewing_key, decode_extsk, default_address,
+    encode_extended_full_viewing_key, encode_extsk, next_address, spending_key_from_seed,
 };
 pub use prover::{
     load_prover, load_prover_from_bytes, load_prover_from_path, load_prover_from_url,
     prover_is_loaded,
 };
 pub use transaction::{BuiltTransaction, SerializedNote, Utxo};
+pub use transparent::{
+    decode_address, derive_key, hash160, is_valid_address, p2pkh_address, AddressKind,
+    DecodedAddress, TransparentKey,
+};
 pub use wallet::{AttributedNote, Inputs, SendOptions, ShieldWallet, WalletBlock};

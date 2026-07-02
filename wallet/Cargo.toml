@@ -27,13 +27,18 @@ zcash_transparent = { git = "https://github.com/Duddino/librustpivx", branch = "
 sapling = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
 
 incrementalmerkletree = "0.7"
-secp256k1 = "0.29.1"
+secp256k1 = { version = "0.29.1", features = ["rand"] }
 either = "1.13.0"
 rand_core = "0.6.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4.3"
 sha256 = { version = "1.5.0", default-features = false }
+# Transparent HD wallet: BIP32 derivation + base58check addresses.
+sha2 = "0.10"
+ripemd = "0.1"
+hmac = "0.12"
+bs58 = { version = "0.5", features = ["check"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 thiserror = "2"

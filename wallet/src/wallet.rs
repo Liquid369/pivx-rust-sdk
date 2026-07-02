@@ -598,6 +598,9 @@ mod rpc_sync {
         /// a self-consistent fabricated chain. Point this at a node you trust.
         /// See SECURITY.md.
         pub async fn sync(&mut self, client: &PivxClient, batch_size: i64) -> Result<()> {
+            // batch_size <= 0 would make an empty range and a misleading
+            // error; clamp like the transparent wallet's sync.
+            let batch_size = batch_size.max(1);
             let tip = client.get_block_count().await?;
             self.ensure_valid_checkpoint(client).await?;
             while self.last_processed_block < tip {

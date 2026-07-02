@@ -282,6 +282,12 @@ impl TransparentWallet {
                 "amount must be greater than zero".into(),
             ));
         }
+        // A zero feerate would build a valid-looking but unrelayable tx.
+        if fee_per_byte == Some(0) {
+            return Err(WalletError::Other(
+                "fee_per_byte must be greater than zero".into(),
+            ));
+        }
         let dest = decode_address(to)?;
         // A mainnet wallet must not build a send to a testnet-encoded address
         // (or vice versa): the 20-byte hash would be spent to this network's
@@ -518,6 +524,25 @@ mod tests {
         assert!(w.build_send(&dest, 5000, Some(100)).is_err());
         // At/above dust it builds.
         assert!(w.build_send(&dest, 100_000_000, Some(100)).is_ok());
+    }
+
+    #[test]
+    fn build_send_rejects_zero_fee_per_byte() {
+        let seed = [8u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        w.add_utxo(
+            "cc".repeat(32).as_str(),
+            0,
+            200_000_000,
+            spk(&p2pkh_address(&a0.public_key, MainNetwork)),
+        );
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        // Some(0) would build a zero-fee tx the network won't relay.
+        let err = w.build_send(&dest, 100_000_000, Some(0)).unwrap_err();
+        assert!(err.to_string().contains("fee_per_byte"));
+        // None (default feerate) still builds.
+        assert!(w.build_send(&dest, 100_000_000, None).is_ok());
     }
 
     #[test]

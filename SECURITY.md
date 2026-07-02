@@ -103,5 +103,7 @@ regardless of download source.
 
 ## Reporting
 
-Report vulnerabilities in this SDK to the PIVX security process rather than a
-public issue. Consensus-level or `librustpivx` issues belong upstream.
+Report vulnerabilities in this SDK privately — email
+[liquid369@gmail.com](mailto:liquid369@gmail.com) or open a private GitHub
+security advisory on this repository — rather than a public issue.
+Consensus-level or `librustpivx` issues belong upstream.

@@ -37,7 +37,8 @@ languages.
   - Net, mempool, mining, and util: `getPeerInfo`, `getConnectionCount`,
     `getNetworkInfo`, `getMempoolInfo`, `getRawMempool`, `estimateFee`,
     `estimateSmartFee`, `getMiningInfo`, `verifyMessage`, `getSupplyInfo`,
-    `getBlockIndexStats`.
+    `getBlockIndexStats`. Note: `getmininginfo` requires a daemon compiled
+    with `--enable-mining-rpc`, which is off in standard release builds.
 - Method names are camelCase in JS, snake_case in Rust
   (`getMasternodeCount` / `get_masternode_count`). Typed methods cover the
   common surface; the generic `call` still reaches any of the node's 224 RPCs.
@@ -208,7 +209,9 @@ ECDSA-signed legacy transactions. Amounts are integer satoshis.
 
 ## Runtime notes
 
-- JS: Node 18+ and browsers, ESM, `pivx-rpc` has no runtime dependencies.
+- JS: Node 20.19+, ESM; browser-compatible (bundler required for WASM;
+  multicore proving needs cross-origin isolation). `pivx-rpc` has no
+  runtime dependencies.
 - Rust: async (`reqwest`/`tokio`); the `rpc` feature (default on) provides
   node-driven sync and broadcast and can be disabled to bring your own
   transport.

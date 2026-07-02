@@ -240,19 +240,18 @@ restored.load_spending_key(&extsk)?;          // only where spending happens
 ```
 
 `save()` output contains the viewing key, sync position, commitment tree,
-and notes. It cannot spend, but it can see: anyone holding it can decrypt
-this wallet's transaction history. Store it with the same care as customer
-data. Store the spending key separately, encrypted, ideally on fewer hosts.
+notes, and pending spends. It cannot spend, but it can see: anyone holding
+it can decrypt this wallet's transaction history. Store it with the same
+care as customer data. Store the spending key separately, encrypted,
+ideally on fewer hosts.
 
-Save after every sync. Two things are deliberately not persisted:
-
-- Pending spends. If the process dies between `create_transaction` and
-  `finalize_transaction`, a restored wallet believes the notes are still
-  spendable. A second send would double-spend notes already committed to an
-  in-flight transaction, and the network will reject it. After a crash,
-  wait until the in-flight txid confirms or is clearly gone, sync, then
-  resume sending.
-- The spending key, as above.
+Save after every sync and after every send. Pending spends are persisted:
+notes committed to a broadcast-but-unconfirmed transaction survive
+`save()`/`load()`, so a crash between broadcast and finalize cannot
+resurrect them into a double-spend — provided the state you restore was
+saved after the send. After a crash, wait for the in-flight txid to
+confirm or clearly disappear, sync, then resume sending. The spending key
+is never persisted, as above.
 
 The state format is versioned JSON, identical across the JS and Rust SDKs.
 
@@ -270,13 +269,11 @@ pivx_wallet::load_prover_from_path("/var/lib/pivx-params").await?;  // sapling-*
 Then:
 
 ```rust
-use pivx_wallet::{Inputs, SendOptions};
+use pivx_wallet::SendOptions;
 
 let txid = wallet.send(&client, &SendOptions {
-    to: "ps1...".into(),
-    amount: 150_000_000,                 // sats
-    memo: Some("payout 991".into()),     // shield recipients only, <= 512 bytes UTF-8
-    inputs: Inputs::Shield,
+    memo: Some("payout 991".into()),          // shield recipients only, <= 512 bytes UTF-8
+    ..SendOptions::shield("ps1...", 150_000_000)   // amount in sats
 }).await?;
 ```
 
@@ -287,16 +284,28 @@ settles the pending state. To broadcast yourself:
 let tx = wallet.create_transaction(&opts).await?;
 match client.send_raw_transaction(&tx.txhex).await {
     Ok(_) => wallet.finalize_transaction(&tx.txid),
-    Err(e) => { wallet.discard_transaction(&tx.txid); return Err(e.into()); }
+    // Discard only on a definitive node rejection.
+    Err(e @ pivx_rpc::Error::Rpc { .. }) => {
+        wallet.discard_transaction(&tx.txid);
+        return Err(e.into());
+    }
+    Err(e) => return Err(e.into()),
 }
 ```
+
+Discard only on `Error::Rpc` (a definitive node rejection): a transport
+failure is ambiguous — the node may have accepted the transaction — so the
+notes must stay pending until the txid confirms or clearly disappears, or
+a retry could double-spend them.
 
 Fee behavior to know before wiring withdrawals: the fee is size-based
 (1000 sats/byte over a fixed model; a typical 1-in-2-out shield spend pays
 about 0.024 PIV). When the wallet's funds cover the amount but not
-amount + fee, the fee is deducted from the recipient's amount rather than
-failing. For exact payouts, keep a fee margin above the requested amount
-and treat balance-emptying sends as sweep semantics.
+amount + fee, the send is rejected (`InsufficientBalance`) rather than
+silently underpaying the recipient. To empty a wallet, opt in with
+`subtract_fee_from_amount: true`, which deducts the fee from the
+recipient's amount instead. For exact payouts, keep fee headroom above the
+requested amount.
 
 Notes selected into a transaction are excluded from `balance()` until you
 finalize or discard. Change returns to a fresh address of this wallet and

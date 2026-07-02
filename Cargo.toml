@@ -7,4 +7,4 @@ members = ["rpc", "wallet"]
 [patch.crates-io]
 orchard = { git = "https://github.com/zcash/orchard.git", rev = "c684e9185a0449efb00428f807d3bf286b5dae03" }
 redjubjub = { git = "https://github.com/ZcashFoundation/redjubjub", rev = "eae848c5c14d9c795d000dd9f4c4762d1aee7ee1" }
-bellman = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
+bellman = { git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a" }

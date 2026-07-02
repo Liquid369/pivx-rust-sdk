@@ -2,10 +2,16 @@
 name = "pivx-wallet"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source."
 license = "MIT"
 repository = "https://github.com/Liquid369/pivx-rust-sdk"
+readme = "README.md"
 keywords = ["pivx", "wallet", "sapling", "shield", "sdk"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 # Crypto core adapted from PIVX-Labs/pivx-shield (MIT). Not publishable to
 # crates.io until librustpivx is published there (git dependencies below).
@@ -18,13 +24,13 @@ rpc = ["dep:pivx-rpc"]
 [dependencies]
 pivx-rpc = { path = "../rpc", optional = true }
 
-pivx_client_backend = { package = "zcash_client_backend", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
-pivx_primitives = { package = "zcash_primitives", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false, features = ["transparent-inputs", "circuits", "std", "non-standard-fees"] }
-pivx_proofs = { package = "zcash_proofs", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false }
-pivx_protocol = { package = "zcash_protocol", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false }
-zcash_keys = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", features = ["unstable"] }
-zcash_transparent = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
-sapling = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
+pivx_client_backend = { package = "zcash_client_backend", git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a" }
+pivx_primitives = { package = "zcash_primitives", git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a", default-features = false, features = ["transparent-inputs", "circuits", "std", "non-standard-fees"] }
+pivx_proofs = { package = "zcash_proofs", git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a", default-features = false }
+pivx_protocol = { package = "zcash_protocol", git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a", default-features = false }
+zcash_keys = { git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a", features = ["unstable"] }
+zcash_transparent = { git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a" }
+sapling = { git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a" }
 
 incrementalmerkletree = "0.7"
 secp256k1 = { version = "0.29.1", features = ["rand"] }
@@ -33,7 +39,6 @@ rand_core = "0.6.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4.3"
-sha256 = { version = "1.5.0", default-features = false }
 # Transparent HD wallet: BIP32 derivation + base58check addresses.
 sha2 = "0.10"
 ripemd = "0.1"

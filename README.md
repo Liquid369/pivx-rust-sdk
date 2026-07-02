@@ -15,7 +15,7 @@ upgradeable in place. Wallet state JSON is interchangeable with the
 
 ```rust
 use pivx_rpc::{Auth, PivxClient};
-use pivx_wallet::{Inputs, Network, SendOptions, ShieldWallet};
+use pivx_wallet::{Network, SendOptions, ShieldWallet};
 
 // exchange deposit detection: keys never on this host
 let mut wallet = ShieldWallet::from_viewing_key(&vkey, Network::MainNetwork, 4_800_000)?;
@@ -25,7 +25,8 @@ println!("{} sats", wallet.balance());
 // standalone send (spending key + prover)
 pivx_wallet::load_prover().await?;
 let txid = wallet.send(&client, &SendOptions {
-    to: "ps1…".into(), amount: 150_000_000, memo: Some("hi".into()), inputs: Inputs::Shield,
+    memo: Some("hi".into()),
+    ..SendOptions::shield("ps1…", 150_000_000)
 }).await?;
 ```
 

@@ -58,18 +58,28 @@ fn write_script(out: &mut Vec<u8>, script: &[u8]) {
     out.extend_from_slice(script);
 }
 
-/// scriptPubKey for a destination address. Supports the spendable transparent
-/// output types (P2PKH, P2SH, exchange). Exchange addresses pay to the same
-/// P2PKH script as a normal key hash — the address encoding differs, the
-/// output script does not.
+/// scriptPubKey for a destination address (P2PKH, P2SH, or exchange).
+///
+/// An exchange address is NOT a plain P2PKH: PIVX prefixes the P2PKH script
+/// with OP_EXCHANGEADDR (0xe0) — see GetScriptForDestination / CScriptVisitor
+/// in src/script/standard.cpp. Emitting a plain P2PKH would send to the wrong
+/// script.
 pub fn script_pubkey_for_address(address: &str) -> Result<Vec<u8>, WalletError> {
     let d = decode_address(address)?;
     Ok(match d.kind {
-        AddressKind::P2pkh | AddressKind::Exchange => {
+        AddressKind::P2pkh => {
             let mut s = Vec::with_capacity(25);
             s.extend_from_slice(&[0x76, 0xa9, 0x14]); // OP_DUP OP_HASH160 push20
             s.extend_from_slice(&d.hash);
             s.extend_from_slice(&[0x88, 0xac]); // OP_EQUALVERIFY OP_CHECKSIG
+            s
+        }
+        AddressKind::Exchange => {
+            let mut s = Vec::with_capacity(26);
+            s.push(0xe0); // OP_EXCHANGEADDR
+            s.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            s.extend_from_slice(&d.hash);
+            s.extend_from_slice(&[0x88, 0xac]);
             s
         }
         AddressKind::P2sh => {
@@ -183,6 +193,17 @@ mod tests {
         assert_eq!(s.len(), 25);
         assert_eq!(&s[..3], &[0x76, 0xa9, 0x14]);
         assert_eq!(&s[23..], &[0x88, 0xac]);
+    }
+
+    #[test]
+    fn exchange_script_has_op_exchangeaddr_prefix() {
+        // Exchange output = OP_EXCHANGEADDR (0xe0) + P2PKH.
+        let addr =
+            crate::transparent::encode_address(&[0x11; 20], MainNetwork, AddressKind::Exchange);
+        let s = script_pubkey_for_address(&addr).unwrap();
+        assert_eq!(s.len(), 26);
+        assert_eq!(&s[..4], &[0xe0, 0x76, 0xa9, 0x14]);
+        assert_eq!(&s[24..], &[0x88, 0xac]);
     }
 
     #[test]

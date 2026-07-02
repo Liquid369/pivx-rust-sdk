@@ -637,11 +637,13 @@ mod rpc_sync {
                 }
 
                 // Snapshot so a failed root check can't leave partial state.
+                // Includes pending_spends because handle_blocks reconciles it.
                 let snapshot = (
                     self.commitment_tree.clone(),
                     self.last_processed_block,
                     self.notes.clone(),
                     self.nullifier_map.clone(),
+                    self.pending_spends.clone(),
                 );
                 let result = (|| {
                     self.handle_blocks(&blocks)?;
@@ -666,6 +668,7 @@ mod rpc_sync {
                     self.last_processed_block = snapshot.1;
                     self.notes = snapshot.2;
                     self.nullifier_map = snapshot.3;
+                    self.pending_spends = snapshot.4;
                 }
                 result?;
             }

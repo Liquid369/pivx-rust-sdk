@@ -435,15 +435,35 @@ mod rpc_sync {
     use super::*;
     use pivx_rpc::PivxClient;
 
-    /// The node's `finalsaplingroot` at height `h`, or None below shield
-    /// activation / when the node omits it.
-    async fn node_sapling_root(client: &PivxClient, h: i64) -> Result<Option<String>> {
-        if h <= 0 {
+    /// Heights at/after which a block must carry a sapling root. Below these
+    /// the node legitimately has none.
+    fn sapling_activation(network: Network) -> i64 {
+        match network {
+            Network::MainNetwork => 2_700_000,
+            Network::TestNetwork => 43_200,
+        }
+    }
+
+    /// The node's `finalsaplingroot` at height `h`, or None below activation.
+    /// Above activation an omitted root is an error, not "no root" — otherwise
+    /// a node could suppress the checkpoint check or force a full rewind by
+    /// simply withholding the field.
+    async fn node_sapling_root(
+        client: &PivxClient,
+        h: i64,
+        network: Network,
+    ) -> Result<Option<String>> {
+        if h < sapling_activation(network) {
             return Ok(None);
         }
         let hash = client.get_block_hash(h).await?;
         let block = client.get_block(&hash, 1).await?;
-        Ok(block["finalsaplingroot"].as_str().map(String::from))
+        match block["finalsaplingroot"].as_str() {
+            Some(r) => Ok(Some(r.to_string())),
+            None => Err(WalletError::Other(format!(
+                "node omitted finalsaplingroot at height {h} (past sapling activation)"
+            ))),
+        }
     }
 
     /// Root of a checkpoint tree in the node's display byte order.
@@ -467,11 +487,19 @@ mod rpc_sync {
                 return Ok(());
             }
             let local = reversed_root(&self.commitment_tree)?;
-            match node_sapling_root(client, self.last_processed_block).await? {
+            match node_sapling_root(client, self.last_processed_block, self.network).await? {
                 None => {}
                 Some(n) if n == local => {}
                 Some(n) => {
-                    if !self.notes.is_empty() || !self.pending_spends.is_empty() {
+                    // A rewind is only appropriate for a fresh wallet still
+                    // sitting on a bundled checkpoint. A wallet that scanned
+                    // forward (past a checkpoint, or holding notes) and no
+                    // longer matches is diverged — rewinding would silently
+                    // discard correct progress.
+                    let (nearest, _) =
+                        get_checkpoint(self.last_processed_block as i32, self.network);
+                    let at_checkpoint = nearest as i64 == self.last_processed_block;
+                    if !self.notes.is_empty() || !self.pending_spends.is_empty() || !at_checkpoint {
                         return Err(WalletError::ScanDiverged {
                             height: self.last_processed_block,
                             local,
@@ -487,7 +515,7 @@ mod rpc_sync {
                             break; // no older checkpoint available
                         }
                         last_cp = cp_h;
-                        let node_root = node_sapling_root(client, cp_h).await?;
+                        let node_root = node_sapling_root(client, cp_h, self.network).await?;
                         let cp_root = reversed_root(cp_tree)?;
                         if node_root.is_none() || node_root.as_deref() == Some(cp_root.as_str()) {
                             self.commitment_tree = cp_tree.to_string();
@@ -502,8 +530,14 @@ mod rpc_sync {
             Ok(())
         }
 
-        /// Sync from the node to its tip, verifying the local tree against
-        /// the node's `finalsaplingroot` each batch.
+        /// Sync from the node to its tip.
+        ///
+        /// Each batch checks the locally-built tree against the node's own
+        /// `finalsaplingroot`. That catches malformed or mis-ordered data,
+        /// but it is a self-consistency check, not chain authentication: the
+        /// SDK does not validate proof-of-stake, so a dishonest node can serve
+        /// a self-consistent fabricated chain. Point this at a node you trust.
+        /// See SECURITY.md.
         pub async fn sync(&mut self, client: &PivxClient, batch_size: i64) -> Result<()> {
             let tip = client.get_block_count().await?;
             self.ensure_valid_checkpoint(client).await?;

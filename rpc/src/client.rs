@@ -347,4 +347,134 @@ impl PivxClient {
         )
         .await
     }
+
+    // ── Masternode ───────────────────────────────────────────────────────
+
+    pub async fn get_masternode_count(&self) -> Result<i64> {
+        self.call("getmasternodecount", vec![]).await
+    }
+
+    /// Legacy masternode list; `filter` matches address/txhash/status/etc.
+    pub async fn list_masternodes(&self, filter: Option<&str>) -> Result<Value> {
+        self.call("listmasternodes", vec![json!(filter)]).await
+    }
+
+    /// This node's masternode status (errors if the node isn't a masternode).
+    pub async fn get_masternode_status(&self) -> Result<Value> {
+        self.call("getmasternodestatus", vec![]).await
+    }
+
+    /// The masternode currently scheduled to be paid.
+    pub async fn masternode_current(&self) -> Result<Value> {
+        self.call("masternodecurrent", vec![]).await
+    }
+
+    // ── Deterministic MN (evo) ───────────────────────────────────────────
+
+    /// Deterministic masternode list. All args optional (node defaults).
+    pub async fn protx_list(
+        &self,
+        detailed: Option<bool>,
+        wallet_only: Option<bool>,
+        valid_only: Option<bool>,
+        height: Option<i64>,
+    ) -> Result<Value> {
+        self.call(
+            "protx_list",
+            vec![
+                json!(detailed),
+                json!(wallet_only),
+                json!(valid_only),
+                json!(height),
+            ],
+        )
+        .await
+    }
+
+    // ── Budget / governance ──────────────────────────────────────────────
+
+    /// Budget proposal(s); `name` limits the result to one proposal.
+    pub async fn get_budget_info(&self, name: Option<&str>) -> Result<Value> {
+        self.call("getbudgetinfo", vec![json!(name)]).await
+    }
+
+    pub async fn get_budget_projection(&self) -> Result<Value> {
+        self.call("getbudgetprojection", vec![]).await
+    }
+
+    // ── Staking / cold-staking (wallet) ──────────────────────────────────
+
+    pub async fn get_staking_status(&self) -> Result<Value> {
+        self.call("getstakingstatus", vec![]).await
+    }
+
+    pub async fn list_staking_addresses(&self) -> Result<Value> {
+        self.call("liststakingaddresses", vec![]).await
+    }
+
+    pub async fn get_cold_staking_balance(&self) -> Result<f64> {
+        self.call("getcoldstakingbalance", vec![]).await
+    }
+
+    // ── Network / mempool / mining / util ────────────────────────────────
+
+    pub async fn get_peer_info(&self) -> Result<Value> {
+        self.call("getpeerinfo", vec![]).await
+    }
+
+    pub async fn get_connection_count(&self) -> Result<i64> {
+        self.call("getconnectioncount", vec![]).await
+    }
+
+    pub async fn get_network_info(&self) -> Result<Value> {
+        self.call("getnetworkinfo", vec![]).await
+    }
+
+    pub async fn get_mempool_info(&self) -> Result<Value> {
+        self.call("getmempoolinfo", vec![]).await
+    }
+
+    /// `verbose` false = array of txids, true = object keyed by txid.
+    pub async fn get_raw_mempool(&self, verbose: Option<bool>) -> Result<Value> {
+        self.call("getrawmempool", vec![json!(verbose)]).await
+    }
+
+    /// Estimated fee-per-kB for confirmation within `nblocks`; -1 if unknown.
+    pub async fn estimate_fee(&self, nblocks: i64) -> Result<f64> {
+        self.call("estimatefee", vec![json!(nblocks)]).await
+    }
+
+    /// `{ feerate, blocks }`; feerate is -1 if not enough data.
+    pub async fn estimate_smart_fee(&self, nblocks: i64) -> Result<Value> {
+        self.call("estimatesmartfee", vec![json!(nblocks)]).await
+    }
+
+    pub async fn get_mining_info(&self) -> Result<Value> {
+        self.call("getmininginfo", vec![]).await
+    }
+
+    /// True if `signature` is a valid signing of `message` by `address`.
+    pub async fn verify_message(
+        &self,
+        address: &str,
+        signature: &str,
+        message: &str,
+    ) -> Result<bool> {
+        self.call(
+            "verifymessage",
+            vec![json!(address), json!(signature), json!(message)],
+        )
+        .await
+    }
+
+    /// Coin supply totals (transparent + shield). `force_update` recomputes.
+    pub async fn get_supply_info(&self, force_update: Option<bool>) -> Result<Value> {
+        self.call("getsupplyinfo", vec![json!(force_update)]).await
+    }
+
+    /// Aggregate stats over `range` blocks ending at `height`.
+    pub async fn get_block_index_stats(&self, height: i64, range: i64) -> Result<Value> {
+        self.call("getblockindexstats", vec![json!(height), json!(range)])
+            .await
+    }
 }

@@ -50,6 +50,8 @@ pub struct TransparentWallet {
     change: Vec<[u8; 20]>,
     next_change: usize,
     utxos: HashMap<(String, u32), OwnedUtxo>,
+    /// Height of the last block passed to [`scan_block`](Self::scan_block).
+    last_scanned: i64,
 }
 
 impl TransparentWallet {
@@ -78,6 +80,7 @@ impl TransparentWallet {
             change,
             next_change: 0,
             utxos: HashMap::new(),
+            last_scanned: 0,
         })
     }
 
@@ -149,6 +152,49 @@ impl TransparentWallet {
         }
     }
 
+    /// Scan one decoded block (`getblock <hash> 2`): credit every output that
+    /// pays us and remove every tracked UTXO the block spends. Coinbase vins
+    /// (no prevout `txid`) are skipped. Records the block's height as the last
+    /// scanned. Malformed tx/vout/vin entries are skipped, not fatal.
+    pub fn scan_block(&mut self, block: &serde_json::Value) {
+        if let Some(h) = block["height"].as_i64() {
+            self.last_scanned = h;
+        }
+        let Some(txs) = block["tx"].as_array() else {
+            return;
+        };
+        for tx in txs {
+            let Some(txid) = tx["txid"].as_str() else {
+                continue;
+            };
+            for vout in tx["vout"].as_array().into_iter().flatten() {
+                let (Some(n), Some(value), Some(hex_str)) = (
+                    vout["n"].as_u64(),
+                    vout["value"].as_f64(),
+                    vout["scriptPubKey"]["hex"].as_str(),
+                ) else {
+                    continue;
+                };
+                let Ok(script) = hex::decode(hex_str) else {
+                    continue;
+                };
+                self.add_utxo(txid, n as u32, (value * 1e8).round() as u64, script);
+            }
+            for vin in tx["vin"].as_array().into_iter().flatten() {
+                // Coinbase vins have no prevout `txid`.
+                let (Some(prev), Some(vout)) = (vin["txid"].as_str(), vin["vout"].as_u64()) else {
+                    continue;
+                };
+                self.utxos.remove(&(prev.to_string(), vout as u32));
+            }
+        }
+    }
+
+    /// Height of the last block passed to [`scan_block`](Self::scan_block) (0 if none).
+    pub fn last_scanned_block(&self) -> i64 {
+        self.last_scanned
+    }
+
     /// Total tracked transparent balance in satoshis.
     pub fn balance(&self) -> u64 {
         self.utxos
@@ -190,7 +236,7 @@ impl TransparentWallet {
         let feerate = fee_per_byte.unwrap_or(100);
 
         let mut avail: Vec<&OwnedUtxo> = self.utxos.values().collect();
-        avail.sort_by(|a, b| b.amount.cmp(&a.amount)); // largest first
+        avail.sort_by_key(|u| std::cmp::Reverse(u.amount)); // largest first
 
         let mut selected: Vec<OwnedUtxo> = Vec::new();
         let mut total: u64 = 0;
@@ -250,6 +296,37 @@ impl TransparentWallet {
     }
 }
 
+#[cfg(feature = "rpc")]
+impl TransparentWallet {
+    /// Scan the node's chain into the wallet, from `max(from_height,
+    /// last_scanned + 1)` up to the current tip, fetching each block with
+    /// `getblockhash` + `getblock(hash, 2)` and feeding it to
+    /// [`scan_block`](Self::scan_block). Fetches in windows of `batch_size`.
+    ///
+    /// Like the shield wallet's sync this is a chain-data pull, not chain
+    /// authentication: point it at a node you trust. See SECURITY.md.
+    pub async fn sync(
+        &mut self,
+        client: &pivx_rpc::PivxClient,
+        from_height: i64,
+        batch_size: i64,
+    ) -> Result<(), WalletError> {
+        let tip = client.get_block_count().await?;
+        let batch = batch_size.max(1);
+        let mut from = from_height.max(self.last_scanned + 1);
+        while from <= tip {
+            let to = (from + batch - 1).min(tip);
+            for h in from..=to {
+                let hash = client.get_block_hash(h).await?;
+                let block = client.get_block(&hash, 2).await?;
+                self.scan_block(&block);
+            }
+            from = to + 1;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +363,40 @@ mod tests {
         assert_eq!(spent.len(), 1);
         w.mark_spent(&spent);
         assert_eq!(w.balance(), 0);
+    }
+
+    #[test]
+    fn scan_block_credits_and_spends() {
+        let seed = [7u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 20).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+
+        // Block 100: a tx paying us 1.5 PIV at vout 0 (coinbase vin skipped).
+        let block1 = serde_json::json!({
+            "height": 100,
+            "tx": [{
+                "txid": "aa".repeat(32),
+                "vin": [{ "coinbase": "00" }],
+                "vout": [{ "n": 0, "value": 1.5, "scriptPubKey": { "hex": spk_hex } }],
+            }],
+        });
+        w.scan_block(&block1);
+        assert_eq!(w.balance(), 150_000_000);
+        assert_eq!(w.last_scanned_block(), 100);
+
+        // Block 101: a tx spending that UTXO (aa:0).
+        let block2 = serde_json::json!({
+            "height": 101,
+            "tx": [{
+                "txid": "bb".repeat(32),
+                "vin": [{ "txid": "aa".repeat(32), "vout": 0 }],
+                "vout": [],
+            }],
+        });
+        w.scan_block(&block2);
+        assert_eq!(w.balance(), 0);
+        assert_eq!(w.last_scanned_block(), 101);
     }
 
     #[test]

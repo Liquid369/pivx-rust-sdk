@@ -1,0 +1,42 @@
+[package]
+name = "pivx-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source."
+license = "MIT"
+repository = "https://github.com/PIVX-Project/pivx-sdk"
+keywords = ["pivx", "wallet", "sapling", "shield", "sdk"]
+
+# Crypto core adapted from PIVX-Labs/pivx-shield (MIT). Not publishable to
+# crates.io until librustpivx is published there (git dependencies below).
+
+[features]
+default = ["rpc"]
+# Chain sync via a pivxd node using the pivx-rpc crate.
+rpc = ["dep:pivx-rpc"]
+
+[dependencies]
+pivx-rpc = { path = "../rpc", optional = true }
+
+pivx_client_backend = { package = "zcash_client_backend", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
+pivx_primitives = { package = "zcash_primitives", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false, features = ["transparent-inputs", "circuits", "std", "non-standard-fees"] }
+pivx_proofs = { package = "zcash_proofs", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false }
+pivx_protocol = { package = "zcash_protocol", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false }
+zcash_keys = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", features = ["unstable"] }
+zcash_transparent = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
+sapling = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
+
+incrementalmerkletree = "0.7"
+secp256k1 = "0.29.1"
+either = "1.13.0"
+rand_core = "0.6.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4.3"
+sha256 = { version = "1.5.0", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

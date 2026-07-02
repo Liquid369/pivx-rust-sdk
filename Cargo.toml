@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["rpc", "wallet"]
+
+# Required by the librustpivx dependency tree (same pins as PIVX-Labs/pivx-shield).
+# Cargo.lock also pins core2 0.3.x (yanked upstream) — do not delete the lockfile.
+[patch.crates-io]
+orchard = { git = "https://github.com/zcash/orchard.git", rev = "c684e9185a0449efb00428f807d3bf286b5dae03" }
+redjubjub = { git = "https://github.com/ZcashFoundation/redjubjub", rev = "eae848c5c14d9c795d000dd9f4c4762d1aee7ee1" }
+bellman = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }

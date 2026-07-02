@@ -207,7 +207,16 @@ pub fn scan_transactions(
 
     Ok(ScanResult {
         notes: serialize_notes(notes).map_err(WalletError::from)?,
-        new_notes: serialize_notes(new_notes).map_err(WalletError::from)?,
+        // Do not retain sub-dust notes: they are never spendable, so keeping
+        // them would let a dust flood grow state and per-block scan cost
+        // without bound. Their commitment is already in the tree.
+        new_notes: serialize_notes(
+            new_notes
+                .into_iter()
+                .filter(|n| n.note.value().inner() > DUST_NOTE_SATS)
+                .collect(),
+        )
+        .map_err(WalletError::from)?,
         spent_nullifiers,
         commitment_tree: commitment_tree_to_hex(&tree).map_err(WalletError::from)?,
         wallet_transactions,
@@ -493,9 +502,11 @@ async fn create_transaction_internal(
 
     if change.is_positive() {
         match decode_generic_address(network, change_address)? {
-            GenericAddress::Transparent(x) => builder
-                .add_transparent_output(&x, change)
-                .map_err(|e| WalletError::Other(format!("failed to add transparent change: {e:?}")))?,
+            GenericAddress::Transparent(x) => {
+                builder.add_transparent_output(&x, change).map_err(|e| {
+                    WalletError::Other(format!("failed to add transparent change: {e:?}"))
+                })?
+            }
             GenericAddress::Shield(x) => builder
                 .add_sapling_output::<FeeRule>(None, x, change, MemoBytes::empty())
                 .map_err(|e| WalletError::Other(format!("failed to add shield change: {e:?}")))?,

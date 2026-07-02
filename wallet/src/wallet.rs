@@ -282,6 +282,11 @@ impl ShieldWallet {
             .chain(result.new_notes)
             .filter(|n| !spent.contains(&n.nullifier))
             .collect();
+        // Drop pending-spend entries whose notes are now gone (their tx
+        // confirmed and was scanned out), so pending_spends can't leak.
+        let tracked: HashSet<&String> = self.notes.iter().map(|n| &n.nullifier).collect();
+        self.pending_spends
+            .retain(|_, nulls| nulls.iter().any(|n| tracked.contains(n)));
         self.last_processed_block = last_height;
         Ok(result.wallet_transactions)
     }
@@ -360,6 +365,15 @@ impl ShieldWallet {
         self.pending_spends.remove(txid);
     }
 
+    /// Transactions built and broadcast but not yet finalized or discarded
+    /// (txid → the nullifiers they spend). After a broadcast error left a
+    /// spend ambiguous, use this to find the txid, confirm it on-chain, then
+    /// [`finalize_transaction`](Self::finalize_transaction) or
+    /// [`discard_transaction`](Self::discard_transaction).
+    pub fn pending_transactions(&self) -> &HashMap<String, Vec<String>> {
+        &self.pending_spends
+    }
+
     // ── Persistence ─────────────────────────────────────────────────────
 
     /// Serialize wallet state to JSON (same format as the JS SDK, v1). The
@@ -385,7 +399,28 @@ impl ShieldWallet {
     /// Restore from [`save`](Self::save) output (watch-only until a spending
     /// key is loaded).
     pub fn load(json: &str) -> Result<Self> {
+        Self::load_inner(json, None)
+    }
+
+    /// Restore, requiring the state's viewing key to equal `expected_viewing_key`.
+    ///
+    /// For a watch-only deposit scanner, verify against the key you know this
+    /// wallet should have: a tampered state file that swapped in an attacker's
+    /// viewing key would otherwise silently repoint deposit addresses. Saved-
+    /// state integrity is theft-critical for a watch-only scanner.
+    pub fn load_verified(json: &str, expected_viewing_key: &str) -> Result<Self> {
+        Self::load_inner(json, Some(expected_viewing_key))
+    }
+
+    fn load_inner(json: &str, expected_viewing_key: Option<&str>) -> Result<Self> {
         let state: WalletState = serde_json::from_str(json)?;
+        if let Some(expected) = expected_viewing_key {
+            if expected != state.extfvk {
+                return Err(WalletError::Other(
+                    "wallet state viewing key does not match the expected key".into(),
+                ));
+            }
+        }
         if state.version != 1 {
             return Err(WalletError::Other(format!(
                 "unsupported wallet state version {}",

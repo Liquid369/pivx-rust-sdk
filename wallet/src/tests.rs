@@ -44,6 +44,24 @@ fn scans_real_tx_into_spendable_note() {
 }
 
 #[test]
+fn load_verified_rejects_swapped_viewing_key() {
+    let wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    let json = wallet.save().unwrap();
+    let extfvk = keys::encode_extended_full_viewing_key(
+        &keys::extfvk_from_extsk(&keys::decode_extsk(EXTSK, TestNetwork).unwrap()),
+        TestNetwork,
+    );
+    // Correct expected key loads.
+    assert!(ShieldWallet::load_verified(&json, &extfvk).is_ok());
+    // A different key is rejected.
+    let other = keys::encode_extended_full_viewing_key(
+        &keys::extfvk_from_extsk(&keys::decode_extsk(TX2_EXTSK, TestNetwork).unwrap()),
+        TestNetwork,
+    );
+    assert!(ShieldWallet::load_verified(&json, &other).is_err());
+}
+
+#[test]
 fn handle_blocks_keeps_notes_when_scan_fails() {
     let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
     wallet.handle_blocks(&fixture_block()).unwrap();

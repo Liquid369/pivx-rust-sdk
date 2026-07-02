@@ -58,13 +58,24 @@ PoS/header validation, a node that lies self-consistently is believed.
 - Saved wallet state (`save()` output) contains the **viewing** key. Anyone
   holding it can decrypt this wallet's entire transaction history. Protect it
   like customer data.
+- **Saved-state integrity is theft-critical for a watch-only deposit
+  scanner.** An attacker who can modify the state file could swap in their own
+  viewing key so `getNewAddress` derives deposit addresses they control. Load
+  such wallets with the expected key — `load(json, { expectedViewingKey })`
+  (JS) / `load_verified(json, key)` (Rust) — and store the state with
+  integrity protection.
 
 ## Spending safety
 
-- **Fees are not silently taken from the recipient.** A send whose balance
-  covers the amount but not amount + fee returns an error unless you opt into
-  sweep semantics (`sweep` in JS, `subtract_fee_from_amount` in Rust). For
-  exact payouts, leave fee headroom (a typical shield spend costs ~0.024 PIV).
+- **Fees are not silently taken from the recipient**, on either the shield
+  or the transparent-input path. A send whose inputs cover the amount but not
+  amount + fee returns an error unless you opt into sweep semantics (`sweep`
+  in JS, `subtract_fee_from_amount` in Rust). For exact payouts, leave fee
+  headroom (a typical shield spend costs ~0.024 PIV).
+- **Dust notes are dropped, not tracked.** A note worth no more than its own
+  input fee is never retained or spent, so an attacker cannot freeze
+  withdrawals or bloat wallet state by flooding a deposit address with dust.
+  Such notes are economically unspendable and are excluded from the balance.
 - **Pending spends are persisted.** Notes committed to a broadcast-but-
   unconfirmed transaction survive `save()`/`load()`, so a crash between
   broadcast and finalize cannot resurrect them into a double-spend. After a

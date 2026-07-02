@@ -1,9 +1,11 @@
 # Usage
 
 Two crates. `pivx-rpc` talks to a pivxd node you trust with keys.
-`pivx-wallet` holds keys itself and treats the node as an untrusted data
-source. Most integrations want `pivx-wallet`; use `pivx-rpc` alone when the
-node's built-in wallet already does what you need.
+`pivx-wallet` holds keys itself and uses the node only as a chain-data
+source. That node must be one you trust — the SDK does not validate
+proof-of-stake or the header chain, so a malicious node can fabricate
+deposits (see `SECURITY.md`). Most integrations want `pivx-wallet`; use
+`pivx-rpc` alone when the node's built-in wallet already does what you need.
 
 `pivx-wallet` depends on git crates (librustpivx), so install both via git:
 
@@ -15,6 +17,17 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Both crates are async; examples assume tokio.
+
+## Trust model
+
+The wallet does not validate proof-of-stake or the header chain. Its only
+sync check — comparing the local commitment-tree root to the block's
+`finalsaplingroot` — proves the tree matches *the node's own reported root*,
+not that the chain is real. A malicious node can therefore fabricate a
+deposit to a known address. Point the wallet at a node you control (or
+corroborate across independent nodes), require confirmations before
+crediting. Full detail and the integrator checklist are in
+[`SECURITY.md`](../SECURITY.md).
 
 ## Units
 

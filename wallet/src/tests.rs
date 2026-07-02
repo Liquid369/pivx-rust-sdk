@@ -3,9 +3,8 @@
 
 use crate::test_fixtures::*;
 use crate::transaction::{self, TxOptions};
-use crate::wallet::{Inputs, SendOptions, ShieldWallet, WalletBlock};
+use crate::wallet::{SendOptions, ShieldWallet, WalletBlock};
 use crate::{keys, WalletError};
-use either::Either;
 use pivx_primitives::consensus::Network::TestNetwork;
 
 const BIRTH: i64 = 100;
@@ -51,12 +50,7 @@ async fn watch_only_scans_but_cannot_spend() {
     watch.handle_blocks(&fixture_block()).unwrap();
     assert_eq!(watch.balance(), 1_000_000_000);
 
-    let send = SendOptions {
-        to: SHIELD_ADDRESS.into(),
-        amount: 1,
-        memo: None,
-        inputs: Inputs::Shield,
-    };
+    let send = SendOptions::shield(SHIELD_ADDRESS, 1);
     assert!(matches!(
         watch.create_transaction(&send).await,
         Err(WalletError::NoSpendAuthority)
@@ -118,6 +112,7 @@ async fn builds_transaction_with_expected_nullifier() {
         block_height: 317,
         network: TestNetwork,
         memo: "Test memo".into(),
+        subtract_fee_from_amount: false,
     })
     .await
     .unwrap();
@@ -125,6 +120,64 @@ async fn builds_transaction_with_expected_nullifier() {
     assert_eq!(tx.nullifiers.len(), 1);
     assert_eq!(tx.nullifiers[0], TX2_EXPECTED_NULLIFIER);
     assert!(!tx.txhex.is_empty());
+}
+
+/// Fee must not be silently taken from the recipient unless opted in.
+#[tokio::test]
+async fn refuses_silent_fee_subtraction() {
+    crate::prover::load_prover_from_bytes(&[], &[]).await.unwrap();
+    let extsk = keys::decode_extsk(TX2_EXTSK, TestNetwork).unwrap();
+    let extfvk = keys::encode_extended_full_viewing_key(&keys::extfvk_from_extsk(&extsk), TestNetwork);
+    let scan = transaction::scan_transactions(
+        TX2_TREE,
+        &[TX2_INPUT_TX.to_string()],
+        &keys::decode_extended_full_viewing_key(&extfvk, TestNetwork).unwrap(),
+        TestNetwork,
+        vec![],
+    )
+    .unwrap();
+    let note_value = scan.new_notes[0].note.value().inner();
+
+    // Ask for the entire note value: covers amount but not amount+fee.
+    let opts = |sweep| TxOptions {
+        notes: Some(scan.new_notes.clone()),
+        utxos: None,
+        extsk: &extsk,
+        to_address: "yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D",
+        change_address: TX2_CHANGE_ADDRESS,
+        amount: note_value,
+        block_height: 317,
+        network: TestNetwork,
+        memo: String::new(),
+        subtract_fee_from_amount: sweep,
+    };
+    assert!(matches!(
+        transaction::create_transaction(opts(false)).await,
+        Err(WalletError::InsufficientBalance)
+    ));
+    // With sweep opt-in it succeeds (fee comes out of the amount).
+    assert!(transaction::create_transaction(opts(true)).await.is_ok());
+}
+
+/// Zero amount and oversized memo are rejected up front.
+#[tokio::test]
+async fn rejects_zero_amount_and_oversized_memo() {
+    crate::prover::load_prover_from_bytes(&[], &[]).await.unwrap();
+    let extsk = keys::decode_extsk(TX2_EXTSK, TestNetwork).unwrap();
+    let base = |amount, memo: String| TxOptions {
+        notes: Some(vec![]),
+        utxos: None,
+        extsk: &extsk,
+        to_address: "yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D",
+        change_address: TX2_CHANGE_ADDRESS,
+        amount,
+        block_height: 317,
+        network: TestNetwork,
+        memo,
+        subtract_fee_from_amount: false,
+    };
+    assert!(transaction::create_transaction(base(0, String::new())).await.is_err());
+    assert!(transaction::create_transaction(base(1, "x".repeat(513))).await.is_err());
 }
 
 /// End-to-end through the wallet: scan then build a spend (MockProver).
@@ -140,12 +193,7 @@ async fn wallet_creates_and_finalizes_spend() {
     assert!(balance_before > 0);
 
     let built = wallet
-        .create_transaction(&SendOptions {
-            to: "yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D".into(),
-            amount: 5 * 10e6 as u64,
-            memo: None,
-            inputs: Inputs::Shield,
-        })
+        .create_transaction(&SendOptions::shield("yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D", 5 * 10e6 as u64))
         .await
         .unwrap();
 
@@ -154,12 +202,7 @@ async fn wallet_creates_and_finalizes_spend() {
     wallet.discard_transaction(&built.txid);
     assert_eq!(wallet.balance(), balance_before);
     let built = wallet
-        .create_transaction(&SendOptions {
-            to: "yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D".into(),
-            amount: 5 * 10e6 as u64,
-            memo: None,
-            inputs: Inputs::Shield,
-        })
+        .create_transaction(&SendOptions::shield("yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D", 5 * 10e6 as u64))
         .await
         .unwrap();
     wallet.finalize_transaction(&built.txid);

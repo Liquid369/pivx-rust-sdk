@@ -288,12 +288,23 @@ pub struct TxOptions<'a> {
     pub block_height: u32,
     pub network: Network,
     pub memo: String,
+    /// Allow paying the fee out of the recipient's amount when the inputs
+    /// cover `amount` but not `amount + fee` (sweep semantics). Default false:
+    /// such a case returns `InsufficientBalance` rather than silently
+    /// underpaying the recipient.
+    pub subtract_fee_from_amount: bool,
 }
 
 /// Build and prove a transaction. Inputs are consumed smallest-first.
 pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransaction, WalletError> {
-    let TxOptions { notes, utxos, extsk, to_address, change_address, amount, block_height, network, memo } = options;
+    let TxOptions { notes, utxos, extsk, to_address, change_address, amount, block_height, network, memo, subtract_fee_from_amount } = options;
     assert!(!(notes.is_some() && utxos.is_some()), "Notes and UTXOs were both provided");
+    if amount == 0 {
+        return Err(WalletError::Other("amount must be greater than zero".into()));
+    }
+    if memo.len() > 512 {
+        return Err(WalletError::Other("memo must be at most 512 bytes".into()));
+    }
 
     let input = if let Some(notes) = notes {
         let mut notes: Vec<(Note, String)> = notes.into_iter().map(|n| (n.note, n.witness)).collect();
@@ -315,6 +326,7 @@ pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransacti
         block_height: BlockHeight::from_u32(block_height),
         network,
         memo,
+        subtract_fee_from_amount,
     })
     .await
 }
@@ -328,10 +340,11 @@ struct TxInternalArgs<'a> {
     block_height: BlockHeight,
     network: Network,
     memo: String,
+    subtract_fee_from_amount: bool,
 }
 
 async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTransaction, WalletError> {
-    let TxInternalArgs { inputs, extsk, to_address, change_address, mut amount, block_height, network, memo } = args;
+    let TxInternalArgs { inputs, extsk, to_address, change_address, mut amount, block_height, network, memo, subtract_fee_from_amount } = args;
 
     let anchor = if let Either::Left(ref notes) = inputs {
         match notes.first() {
@@ -376,6 +389,7 @@ async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTr
             &mut amount,
             transparent_output_count,
             sapling_output_count,
+            subtract_fee_from_amount,
         )?,
         Either::Right(utxos) => choose_utxos(
             &mut builder,
@@ -384,6 +398,7 @@ async fn create_transaction_internal(args: TxInternalArgs<'_>) -> Result<BuiltTr
             transparent_output_count,
             sapling_output_count,
             &mut transparent_signing_set,
+            subtract_fee_from_amount,
         )?,
     };
 
@@ -425,8 +440,9 @@ fn choose_utxos(
     transparent_output_count: u64,
     sapling_output_count: u64,
     transparent_signing_set: &mut TransparentSigningSet,
+    subtract_fee_from_amount: bool,
 ) -> Result<(Vec<String>, Zatoshis, u64), WalletError> {
-    let mut total = 0;
+    let mut total: u64 = 0;
     let mut used_utxos = vec![];
     let mut transparent_input_count = 0;
     let mut fee = 0;
@@ -458,12 +474,12 @@ fn choose_utxos(
         transparent_signing_set.add_key(key);
         transparent_input_count += 1;
         fee = fee_calculator(transparent_input_count, transparent_output_count, 0, sapling_output_count);
-        total += utxo.amount;
-        if total >= *amount + fee {
+        total = total.saturating_add(utxo.amount);
+        if total >= amount.saturating_add(fee) {
             break;
         }
     }
-    finish_input_selection(total, amount, fee)
+    finish_input_selection(total, amount, fee, subtract_fee_from_amount)
         .map(|change| (used_utxos, change, fee))
 }
 
@@ -474,8 +490,9 @@ fn choose_notes(
     amount: &mut u64,
     transparent_output_count: u64,
     sapling_output_count: u64,
+    subtract_fee_from_amount: bool,
 ) -> Result<(Vec<String>, Zatoshis, u64), WalletError> {
-    let mut total = 0;
+    let mut total: u64 = 0;
     let mut nullifiers = vec![];
     let mut sapling_input_count = 0;
     let mut fee = 0;
@@ -497,25 +514,39 @@ fn choose_notes(
         nullifiers.push(hex::encode(nullifier.to_vec()));
         sapling_input_count += 1;
         fee = fee_calculator(0, transparent_output_count, sapling_input_count, sapling_output_count);
-        total += note.value().inner();
-        if total >= *amount + fee {
+        total = total.saturating_add(note.value().inner());
+        if total >= amount.saturating_add(fee) {
             break;
         }
     }
-    finish_input_selection(total, amount, fee).map(|change| (nullifiers, change, fee))
+    finish_input_selection(total, amount, fee, subtract_fee_from_amount)
+        .map(|change| (nullifiers, change, fee))
 }
 
-/// Shared tail of input selection: deduct the fee from the amount when the
-/// inputs exactly cover it, else fail; then compute change.
-fn finish_input_selection(total: u64, amount: &mut u64, fee: u64) -> Result<Zatoshis, WalletError> {
-    if total < *amount + fee {
-        if total >= *amount && *amount > fee {
+/// Shared tail of input selection. When the inputs cover `amount` but not
+/// `amount + fee`, the fee is deducted from `amount` only if the caller opted
+/// into sweep semantics — otherwise this is `InsufficientBalance` rather than
+/// a silent underpayment. All arithmetic is overflow-checked so an
+/// adversarial `amount` can neither panic (debug) nor wrap (release).
+fn finish_input_selection(
+    total: u64,
+    amount: &mut u64,
+    fee: u64,
+    subtract_fee_from_amount: bool,
+) -> Result<Zatoshis, WalletError> {
+    let needed = amount.checked_add(fee).ok_or(WalletError::InsufficientBalance)?;
+    if total < needed {
+        if subtract_fee_from_amount && total >= *amount && *amount > fee {
             *amount -= fee;
         } else {
             return Err(WalletError::InsufficientBalance);
         }
     }
-    Zatoshis::from_u64(total - *amount - fee).map_err(|_| WalletError::Other("invalid change".into()))
+    let change = total
+        .checked_sub(*amount)
+        .and_then(|v| v.checked_sub(fee))
+        .ok_or(WalletError::InsufficientBalance)?;
+    Zatoshis::from_u64(change).map_err(|_| WalletError::Other("invalid change".into()))
 }
 
 /// Upstream fee model: 1000 per byte over a fixed size model.

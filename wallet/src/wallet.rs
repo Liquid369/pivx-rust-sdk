@@ -37,6 +37,18 @@ pub struct SendOptions {
     /// UTF-8 memo (shield recipients only, max 512 bytes).
     pub memo: Option<String>,
     pub inputs: Inputs,
+    /// Sweep semantics: when the balance covers `amount` but not
+    /// `amount + fee`, pay the fee out of the recipient's amount instead of
+    /// failing. Default false — an exact payout that leaves no fee headroom
+    /// returns `InsufficientBalance` rather than silently underpaying.
+    pub subtract_fee_from_amount: bool,
+}
+
+impl SendOptions {
+    /// A shield send of `amount` sats to `to`, no memo, fee paid by the sender.
+    pub fn shield(to: impl Into<String>, amount: u64) -> Self {
+        Self { to: to.into(), amount, memo: None, inputs: Inputs::Shield, subtract_fee_from_amount: false }
+    }
 }
 
 /// Serialized wallet state. Field names match the JS `pivx-wallet` package's
@@ -56,6 +68,10 @@ struct WalletState {
     notes: Vec<SerializedNote>,
     #[serde(rename = "nullifierMap")]
     nullifier_map: HashMap<String, AttributedNote>,
+    /// Persisted so a crash between broadcast and finalize can't resurrect
+    /// spent notes. `default` keeps older/JS states without the field loadable.
+    #[serde(rename = "pendingSpends", default)]
+    pending_spends: HashMap<String, Vec<String>>,
 }
 
 /// Note attribution kept per nullifier (payment attribution for spends).
@@ -286,6 +302,7 @@ impl ShieldWallet {
             block_height: (self.last_processed_block + 1) as u32,
             network: self.network,
             memo: opts.memo.clone().unwrap_or_default(),
+            subtract_fee_from_amount: opts.subtract_fee_from_amount,
         })
         .await?;
 
@@ -326,6 +343,7 @@ impl ShieldWallet {
             diversifier_index: self.diversifier_index.to_vec(),
             notes: self.notes.clone(),
             nullifier_map: self.nullifier_map.clone(),
+            pending_spends: self.pending_spends.clone(),
         })?)
     }
 
@@ -357,8 +375,20 @@ impl ShieldWallet {
                 .map_err(|_| WalletError::Other("bad diversifier index".into()))?,
             notes: state.notes,
             nullifier_map: state.nullifier_map,
-            pending_spends: HashMap::new(),
+            pending_spends: state.pending_spends,
         })
+    }
+
+    /// Reset scan state to the checkpoint at or below `height` and drop all
+    /// tracked notes. The documented recovery from `WalletError::ScanDiverged`:
+    /// call this, then re-sync. Requires no keys.
+    pub fn reload_from_checkpoint(&mut self, height: i64) {
+        let (cp_height, cp_tree) = get_checkpoint(height as i32, self.network);
+        self.commitment_tree = cp_tree.to_string();
+        self.last_processed_block = cp_height as i64;
+        self.notes.clear();
+        self.nullifier_map.clear();
+        self.pending_spends.clear();
     }
 }
 
@@ -387,24 +417,50 @@ mod rpc_sync {
                 for h in from..=to {
                     let hash = client.get_block_hash(h).await?;
                     let block = client.get_block(&hash, 2).await?;
+                    // A tx object without "hex" is malformed: fail rather than
+                    // silently dropping it (dropping desyncs the tree).
                     let tx_hexes = block["tx"]
                         .as_array()
-                        .map(|txs| {
-                            txs.iter()
-                                .filter_map(|t| t["hex"].as_str().map(String::from))
-                                .collect()
+                        .ok_or_else(|| WalletError::Other(format!("block {h} has no tx array")))?
+                        .iter()
+                        .map(|t| {
+                            t["hex"]
+                                .as_str()
+                                .map(String::from)
+                                .ok_or_else(|| WalletError::Other(format!("block {h} has a tx without hex")))
                         })
-                        .unwrap_or_default();
+                        .collect::<Result<Vec<_>>>()?;
                     node_root = block["finalsaplingroot"].as_str().map(String::from);
                     blocks.push(WalletBlock { height: h, tx_hexes });
                 }
-                self.handle_blocks(&blocks)?;
-                if let Some(node_root) = node_root {
+
+                // Snapshot so a failed root check can't leave partial state.
+                let snapshot = (
+                    self.commitment_tree.clone(),
+                    self.last_processed_block,
+                    self.notes.clone(),
+                    self.nullifier_map.clone(),
+                );
+                let result = (|| {
+                    self.handle_blocks(&blocks)?;
+                    // A shielded chain always reports a sapling root; a missing
+                    // one means the node is lying or pre-activation. Refuse to
+                    // advance unverified rather than skipping the only check.
+                    let node_root = node_root
+                        .ok_or_else(|| WalletError::Other(format!("node omitted finalsaplingroot at height {to}")))?;
                     let local = self.sapling_root()?;
                     if local != node_root {
                         return Err(WalletError::ScanDiverged { height: to, local, node: node_root });
                     }
+                    Ok(())
+                })();
+                if result.is_err() {
+                    self.commitment_tree = snapshot.0;
+                    self.last_processed_block = snapshot.1;
+                    self.notes = snapshot.2;
+                    self.nullifier_map = snapshot.3;
                 }
+                result?;
             }
             Ok(())
         }

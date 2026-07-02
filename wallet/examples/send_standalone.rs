@@ -3,7 +3,7 @@
 //! Usage: PIVX_RPC_USER=u PIVX_RPC_PASS=p cargo run --release --example send_standalone -- <spending-key> <birth-height> <to> <piv>
 
 use pivx_rpc::{Auth, PivxClient};
-use pivx_wallet::{Inputs, Network, SendOptions, ShieldWallet};
+use pivx_wallet::{Network, SendOptions, ShieldWallet};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,10 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let txid = wallet
         .send(&client, &SendOptions {
-            to,
-            amount: (piv * 1e8).round() as u64,
             memo: Some("standalone pivx-wallet send".into()),
-            inputs: Inputs::Shield,
+            ..SendOptions::shield(to, (piv * 1e8).round() as u64)
         })
         .await?;
     println!("sent: {txid}");

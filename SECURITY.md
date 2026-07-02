@@ -1,0 +1,96 @@
+# Security model
+
+This SDK moves real money. Read this before integrating.
+
+## What the standalone wallet does and does not verify
+
+The `pivx-wallet` layer holds keys locally and uses a `pivxd` node for chain
+data (blocks) and broadcast. It **decrypts and tracks** shielded notes; it
+does **not** verify that the blocks it is fed belong to the real,
+proof-of-stake-secured PIVX chain.
+
+The only integrity check during sync is comparing the locally-computed
+sapling commitment-tree root against the `finalsaplingroot` in the block
+header returned by the node. That is a **self-consistency** check: it
+confirms the local tree matches *the root the same node reported*. It is
+**not authentication** — it does not prove the blocks are real, canonical,
+or the most-work/most-stake chain.
+
+### Consequence: the node is a trust anchor
+
+A malicious or compromised node can:
+
+- **Fabricate a deposit.** Deposit addresses are shared with payers, so an
+  attacker who knows one can craft a syntactically valid shielded output
+  paying that address any amount, put it in a fabricated block, and report a
+  matching `finalsaplingroot`. The wallet decrypts it and counts it as
+  received. If you release funds or goods on that apparent deposit, you lose
+  real money.
+- **Hide a real deposit** by omitting the transaction, or **stall sync** by
+  reporting a low tip.
+
+The SDK closes the *cheap* versions of these (it uses the block height it
+requested rather than the node's echo, treats a missing `finalsaplingroot`
+or a transaction missing its hex as hard errors, and rolls back scan state
+if the root check fails), but it cannot close the fundamental one: without
+PoS/header validation, a node that lies self-consistently is believed.
+
+## Integrator requirements
+
+1. **Use a node you control**, or corroborate across multiple independent
+   nodes before crediting. Do not point a hot wallet at an arbitrary public
+   RPC endpoint.
+2. **Require confirmations.** Never credit a deposit from a single block or
+   from `previewTransaction` (mempool preview does no validation at all —
+   it only trial-decrypts, and gives no txid to dedupe on). Pick a
+   confirmation depth for your risk model; PIVX targets 60-second blocks.
+3. **Run the node and the RPC link on localhost or a private tunnel.** RPC
+   has no transport encryption and uses HTTP Basic auth.
+4. **Reconcile balances against confirmed notes**, not against watch-only
+   balances (an incoming viewing key cannot see spends, so a watch-only
+   balance can over-report).
+
+## Key handling
+
+- Spending keys and seeds are never serialized by `save()`, never logged,
+  and never placed in error messages. Store the spending key separately from
+  saved wallet state, encrypted, on as few hosts as possible.
+- Saved wallet state (`save()` output) contains the **viewing** key. Anyone
+  holding it can decrypt this wallet's entire transaction history. Protect it
+  like customer data.
+
+## Spending safety
+
+- **Fees are not silently taken from the recipient.** A send whose balance
+  covers the amount but not amount + fee returns an error unless you opt into
+  sweep semantics (`sweep` in JS, `subtract_fee_from_amount` in Rust). For
+  exact payouts, leave fee headroom (a typical shield spend costs ~0.024 PIV).
+- **Pending spends are persisted.** Notes committed to a broadcast-but-
+  unconfirmed transaction survive `save()`/`load()`, so a crash between
+  broadcast and finalize cannot resurrect them into a double-spend. After a
+  crash, wait for the in-flight txid to confirm or clearly disappear, sync,
+  then resume — do not force a second send of the same notes.
+- **One writer per wallet.** Do not run two syncs, or a sync and a spend,
+  concurrently on one wallet instance. (Rust enforces this via `&mut`; JS
+  guards it at runtime.)
+
+## Recovery
+
+If sync reports a sapling-root divergence (`ScanDivergedError` in JS,
+`WalletError::ScanDiverged` in Rust) — a reorg crossed a batch boundary, the
+node lied, or saved state is corrupt — call `reloadFromCheckpoint(height)`
+(JS) / `reload_from_checkpoint(height)` (Rust) and re-sync. This resets scan
+state to a checkpoint and rescans; it needs no keys.
+
+## Cryptography provenance
+
+The shielded cryptography is not reimplemented here. It is PIVX Labs'
+`pivx-shield` engine on the `librustpivx` (librustzcash fork) crates — the
+JS SDK loads its WASM build, the Rust SDK vendors the same core natively.
+Sapling proving parameters are SHA-256-pinned against known digests
+regardless of download source.
+
+## Reporting
+
+Report vulnerabilities in this SDK to the PIVX security process rather than a
+public issue. Consensus-level or `librustpivx` issues belong upstream.

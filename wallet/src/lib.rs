@@ -6,7 +6,7 @@
 //! (MIT), on the same librustpivx crates, with the WASM layer removed.
 //!
 //! ```no_run
-//! use pivx_wallet::{Inputs, Network, SendOptions, ShieldWallet};
+//! use pivx_wallet::{Network, SendOptions, ShieldWallet};
 //!
 //! # async fn demo() -> Result<(), pivx_wallet::WalletError> {
 //! // Watch-only from a viewing key (exchanges: keys never touch this host)…
@@ -21,10 +21,8 @@
 //! pivx_wallet::load_prover().await.map_err(|e| pivx_wallet::WalletError::Other(e.to_string()))?;
 //! let txid = wallet
 //!     .send(&client, &SendOptions {
-//!         to: "ps1…".into(),
-//!         amount: 150_000_000,
 //!         memo: Some("hello".into()),
-//!         inputs: Inputs::Shield,
+//!         ..SendOptions::shield("ps1…", 150_000_000)
 //!     })
 //!     .await?;
 //! # }

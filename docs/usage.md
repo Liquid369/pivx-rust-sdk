@@ -370,41 +370,113 @@ let addr = wallet.new_address()?;               // fresh receive address per dep
 // (a) scan the chain
 wallet.sync(&client, 4_800_000, 100).await?;    // from_height, batch_size
 // or feed one decoded block (getblock <hash> 2) from your own source:
-wallet.scan_block(&block);
+wallet.scan_block(&block)?;
 
 // (b) or register a UTXO yourself; returns false if it isn't ours
 wallet.add_utxo(&txid, vout, 200_000_000, script_pubkey);
 
-wallet.balance();                                // sats (u64)
-wallet.utxos().collect::<Vec<_>>();              // tracked unspent outputs
+wallet.balance();                                // sats (u64) — excludes outpoints reserved by build_send
+wallet.utxos().collect::<Vec<_>>();              // all tracked outputs, reserved ones included
+```
+
+`scan_block` checks parent-hash continuity: when a block claims to extend
+the last scanned one (height exactly one higher) but its
+`previousblockhash` differs from the hash recorded, it returns
+`WalletError::ScanDiverged` before mutating any state — the chain
+reorganized under the wallet. This is why `scan_block` now returns
+`Result`, a breaking change from 0.1. Recover with `reset_scan(height)`,
+which drops scanned UTXOs above `height` along with their reservations
+(caller-supplied UTXOs are kept) and re-sync from below the fork point:
+
+```rust
+use pivx_wallet::WalletError;
+
+match wallet.sync(&client, 4_800_000, 100).await {
+    Err(WalletError::ScanDiverged { height, .. }) => {
+        wallet.reset_scan(height - 20);   // a height below the fork point
+        wallet.sync(&client, 0, 100).await?;
+    }
+    other => other?,
+}
 ```
 
 ### Sending
 
 ```rust
 let (hex, spent) = wallet.build_send("D...recipient", 150_000_000, Some(100))?;  // 100 sats/byte
-client.send_raw_transaction(&hex).await?;
-wallet.mark_spent(&spent);                       // only after a successful broadcast
+match client.send_raw_transaction(&hex).await {
+    Ok(_) => wallet.mark_spent(&spent),          // finalize: inputs dropped for good
+    // Release only on a definitive node rejection.
+    Err(e @ pivx_rpc::Error::Rpc { .. }) => {
+        wallet.release(&spent);
+        return Err(e.into());
+    }
+    Err(e) => return Err(e.into()),
+}
 ```
 
 `build_send` selects UTXOs largest-first, signs locally (ECDSA), sizes the
 fee from `fee_per_byte` (defaults to 100 when `None`), and sends change to a
 fresh internal address. It errors if funds can't cover amount + fee rather
-than underpaying. Call `mark_spent(&spent)` only once the broadcast succeeds
-— until then the UTXOs stay spendable, so a failed broadcast can be retried.
-This send path is verified against real mainnet transactions.
+than underpaying. The inputs it selects are reserved: a second `build_send`
+cannot double-spend them before broadcast, and `balance()` excludes them
+(`utxos()` still lists them). `mark_spent(&spent)` finalizes after a
+successful broadcast; `release(&spent)` un-reserves after a definitive node
+rejection (`Error::Rpc`). A transport failure is ambiguous — the node may
+have accepted the transaction — so keep the reservation until the txid
+confirms or clearly disappears, the same rule as the shield wallet's
+discard. This send path is verified against real mainnet transactions.
+
+### Persistence
+
+`save()` returns versioned JSON (version 1) holding the address cursors,
+the UTXO set (with coinbase heights), reservations (pending spends), and
+the last-scanned height and block hash — no key material.
+`load(seed, state)` re-derives the keys from the seed and rejects a state
+that does not match it. The output is byte-identical across the JS and
+Rust SDKs — a state saved by one loads in the other (the test suites
+byte-compare a shared fixture).
+
+```rust
+let json = wallet.save();
+// ... crash, restart, maybe another host or the JS SDK
+let mut restored = TransparentWallet::load(&seed, &json)?;
+```
+
+Reservations survive save/load, so a crash between broadcast and
+`mark_spent` cannot resurrect the inputs into a double-spend — provided the
+state was saved after the send. Save after every sync and every send.
 
 ### Exchange addresses
 
-Exchange addresses (`EXM` mainnet, `EXT` testnet) are a receive-only
-transparent variant, reported as `AddressKind::Exchange`. Validate them and
-send to them like any address; the output carries an `OP_EXCHANGEADDR` prefix
-on an otherwise standard P2PKH script.
+Exchange addresses (`EXM` mainnet, `EXT` testnet) encode the same hash160
+as a P2PKH address behind an `OP_EXCHANGEADDR` (`0xe0`) prefix on an
+otherwise standard P2PKH script, reported as `AddressKind::Exchange`. The
+wallet both sends to them and receives on them.
+
+Sending — validate and pay them like any address:
 
 ```rust
 assert!(is_valid_address("EXM..."));
 assert_eq!(decode_address("EXM...")?.kind, AddressKind::Exchange);
 let (hex, spent) = wallet.build_send("EXM...", 150_000_000, Some(100))?;
 ```
+
+Receiving — `new_exchange_address()` hands out the next external index
+encoded as an exchange address. It shares the cursor and key with
+`new_address()`: the same index's P2PKH form pays this wallet too, the two
+encodings differ only in scriptPubKey. Deposits through the 26-byte
+exchange script are credited by `scan_block` and `add_utxo` exactly like
+P2PKH, and the UTXOs spend like any other:
+
+```rust
+let exm = wallet.new_exchange_address()?;   // "EXM..."
+// after the deposit confirms and a sync/scan picks it up:
+wallet.balance();                            // includes the exchange-script UTXO
+```
+
+This path is verified on mainnet: a deposit to an exchange address was
+detected by a real block scan and the received output spent, accepted by
+the network.
 
 Sending to a cold-staking address is rejected.

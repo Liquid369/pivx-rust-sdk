@@ -7,11 +7,17 @@ pub enum WalletError {
     ProverNotLoaded,
     #[error("not enough balance")]
     InsufficientBalance,
-    /// Local commitment tree diverged from the node's sapling root: wallet
-    /// state is corrupt or the node is on another chain. Recreate the wallet
-    /// from its keys and resync.
-    #[error("sapling root mismatch at height {height}: local {local}, node {node}")]
-    ScanDiverged { height: i64, local: String, node: String },
+    /// Local scan state diverged from the node's chain (shield: commitment
+    /// tree vs the block's sapling root; transparent: parent-hash mismatch).
+    /// Wallet state is stale/corrupt or the node is on another chain.
+    /// Recreate the wallet from its keys (or `reset_scan` for a transparent
+    /// wallet) and resync.
+    #[error("scan diverged at height {height}: local {local}, node {node}")]
+    ScanDiverged {
+        height: i64,
+        local: String,
+        node: String,
+    },
     #[error("invalid key: {0}")]
     InvalidKey(String),
     #[error("invalid address: {0}")]

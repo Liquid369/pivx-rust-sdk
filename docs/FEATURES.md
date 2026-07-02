@@ -165,15 +165,18 @@ ECDSA-signed legacy transactions. Amounts are integer satoshis.
 - PIVX has no address index, so incoming coins are discovered two ways — both
   supported:
   - Block scan: `scanBlock(block)` credits the outputs of a decoded block
-    (`getblock <hash> 2`) that pay this wallet and drops UTXOs it spends;
-    `sync(client, { fromHeight, batchSize })` walks the chain from a height to
-    the tip and scans each block. (Rust: `scan_block`; `sync(client,
-    from_height, batch_size)`.)
+    (`getblock <hash> 2`) that pay this wallet — through a standard 25-byte
+    P2PKH script or the 26-byte `OP_EXCHANGEADDR` exchange script — and drops
+    UTXOs it spends; `sync(client, { fromHeight, batchSize })` walks the chain
+    from a height to the tip and scans each block. In JS only one `sync` runs
+    at a time; a concurrent call throws (the shield wallet's busy guard).
+    (Rust: `scan_block`; `sync(client, from_height, batch_size)`.)
   - Caller-supplied: `addUtxo(txid, vout, amount, scriptPubKey)` registers a
     UTXO you already know about (e.g. from your own indexer), returning whether
     it pays this wallet. (Rust: `add_utxo`.)
-- `balance()` totals tracked unspent value in satoshis; JS `getUtxos()` /
-  Rust `utxos()` list the tracked outputs. (Rust: `balance`.)
+- `balance()` totals tracked unspent value in satoshis, excluding outpoints
+  reserved by `buildSend`; JS `getUtxos()` / Rust `utxos()` list all tracked
+  outputs, reserved ones included. (Rust: `balance`.)
 
 ### Sending
 
@@ -182,9 +185,16 @@ ECDSA-signed legacy transactions. Amounts are integer satoshis.
   change address. It returns the raw tx hex and the list of spent outputs
   (`{ hex, spent }`; Rust: `build_send` → `(hex, spent)`). `feePerByte`
   defaults to 100 sats/byte and the fee is size-based; amounts are satoshis.
-- Broadcast the hex through `pivx-rpc` (`sendRawTransaction`), then call
-  `markSpent(spent)` to drop the consumed UTXOs so a follow-up send cannot
-  reuse them before the spend confirms. (Rust: `mark_spent`.)
+- `buildSend` reserves the UTXOs it selects: a second send cannot
+  double-spend them before broadcast, and `balance()` excludes them.
+  Broadcast the hex through `pivx-rpc` (`sendRawTransaction`), then call
+  `markSpent(spent)` to finalize — it drops the consumed UTXOs and their
+  reservation. After a definitively rejected broadcast, `release(spent)`
+  makes the inputs selectable again; a transport or timeout failure is
+  ambiguous (the node may have accepted the transaction), so keep the
+  reservation until the txid confirms or clearly disappears — the same
+  rule as the shield wallet's discard-only-on-`RpcError`. (Rust:
+  `mark_spent`, `release`.)
 - Coin selection rejects a send that cannot cover amount + fee rather than
   underpaying. The send path is verified against real mainnet transactions.
 - `buildSend` validates the destination up front: it rejects an address from
@@ -198,14 +208,45 @@ ECDSA-signed legacy transactions. Amounts are integer satoshis.
   `nCoinbaseMaturity` blocks deep (100 mainnet, 15 testnet), matching the
   node's maturity rule; caller-supplied UTXOs (`addUtxo`) are assumed mature.
 
+### Persistence and recovery
+
+- `save()` / `load(seed, state)`: versioned JSON state (version 1, camelCase
+  fields) holding the address cursors, the UTXO set (with coinbase heights),
+  reservations (pending spends), and the last-scanned height and block hash.
+  No key material is included; `load` re-derives keys from the seed and
+  rejects a state that does not belong to it. `save()` output is
+  byte-identical across the JS and Rust SDKs — a state saved by one loads in
+  the other, and both test suites byte-compare a shared fixture. (Rust:
+  `save` / `load(seed, state)`.)
+- `scanBlock` verifies parent-hash continuity when a block claims to extend
+  the last scanned one (height exactly one higher) and raises the divergence
+  error (`ScanDivergedError` / `WalletError::ScanDiverged`) before mutating
+  any state: the chain reorganized under the wallet. Breaking change from
+  0.1: JS `scanBlock` now throws in this one case, and Rust `scan_block` now
+  returns `Result`.
+- `resetScan(height)` is the recovery path after a divergence: it drops
+  scanned UTXOs above `height` along with their reservations, keeps
+  caller-supplied ones, and resets the scan position so the wallet can
+  re-sync from below the fork point. (Rust: `reset_scan`.)
+
 ### Exchange addresses
 
-- PIVX exchange addresses (`EXM` on mainnet, `EXT` on testnet) are a
-  receive-only transparent variant. `decodeAddress` / `isValidAddress`
+- PIVX exchange addresses (`EXM` on mainnet, `EXT` on testnet) encode the
+  same hash160 as a P2PKH address behind an `OP_EXCHANGEADDR` (`0xe0`) prefix
+  on an otherwise standard P2PKH script. `decodeAddress` / `isValidAddress`
   recognize and validate them (Rust: `AddressKind::Exchange`).
-- Sending to an exchange address is supported: the output is a standard P2PKH
-  script prefixed with `OP_EXCHANGEADDR` (`0xe0`), so `buildSend` accepts one
-  as a destination. (Sending to a cold-staking address is rejected.)
+- Sending to an exchange address is supported: `buildSend` accepts one as a
+  destination and emits the 26-byte prefixed script. (Sending to a
+  cold-staking address is rejected.)
+- Receiving on an exchange address is supported: the wallet recognizes
+  deposits paying its keys through the 26-byte exchange script as well as
+  plain P2PKH — both `scanBlock` and `addUtxo` credit them, and the UTXOs
+  spend like any other. `newExchangeAddress()` hands out the next external
+  index encoded as an exchange address (Rust: `new_exchange_address`); it
+  shares the cursor and key with `newAddress`, so the same index's P2PKH
+  form also pays the wallet. Verified on mainnet: a deposit to an exchange
+  address was detected by a real block scan and the received output spent,
+  accepted by the network.
 
 ## Runtime notes
 

@@ -11,7 +11,7 @@ shielded (SHIELD/Sapling) support.
 A wallet is constructed from a seed, spending key, **or viewing key** —
 watch-only is a capability level (scan/receive/balance, no spend),
 upgradeable in place. Wallet state JSON is interchangeable with the
-[JS SDK](https://github.com/PIVX-Project/pivx-js-sdk).
+[JS SDK](https://github.com/Liquid369/pivx-js-sdk).
 
 ```rust
 use pivx_rpc::{Auth, PivxClient};

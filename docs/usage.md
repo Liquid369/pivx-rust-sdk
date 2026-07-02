@@ -11,8 +11,8 @@ deposits (see `SECURITY.md`). Most integrations want `pivx-wallet`; use
 
 ```toml
 [dependencies]
-pivx-rpc = { git = "https://github.com/PIVX-Project/pivx-rust-sdk" }
-pivx-wallet = { git = "https://github.com/PIVX-Project/pivx-rust-sdk" }
+pivx-rpc = { git = "https://github.com/Liquid369/pivx-rust-sdk" }
+pivx-wallet = { git = "https://github.com/Liquid369/pivx-rust-sdk" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

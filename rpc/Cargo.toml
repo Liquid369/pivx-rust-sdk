@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "PIVX SDK: typed JSON-RPC client with shielded (SHIELD/Sapling) balance watching and transaction support"
 license = "MIT"
-repository = "https://github.com/PIVX-Project/pivx-sdk"
+repository = "https://github.com/Liquid369/pivx-rust-sdk"
 keywords = ["pivx", "rpc", "sapling", "shield", "blockchain"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
 

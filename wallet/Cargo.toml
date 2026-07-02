@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source."
 license = "MIT"
-repository = "https://github.com/PIVX-Project/pivx-sdk"
+repository = "https://github.com/Liquid369/pivx-rust-sdk"
 keywords = ["pivx", "wallet", "sapling", "shield", "sdk"]
 
 # Crypto core adapted from PIVX-Labs/pivx-shield (MIT). Not publishable to

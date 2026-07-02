@@ -72,9 +72,9 @@ broadcast relay.
 - Only version-3 (sapling) transactions are fed to the scanner; other
   transactions are skipped.
 - Confirmed balance and unspent-note listing, in satoshis.
-- `previewTransaction(hex)`: trial-decrypt a single transaction's outputs
-  without touching wallet state, for mempool hints (does not validate the
-  transaction).
+- `previewTransaction(hex)` (JS only): trial-decrypt a single transaction's
+  outputs without touching wallet state, for mempool hints (does not validate
+  the transaction).
 - Nullifier → note attribution lookup, for reconciling spends.
 
 ### Spending

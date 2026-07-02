@@ -205,11 +205,14 @@ impl ShieldWallet {
     /// Confirmed shielded balance in satoshis (scanned notes minus pending spends).
     pub fn balance(&self) -> u64 {
         let pending: HashSet<&String> = self.pending_spends.values().flatten().collect();
+        // Saturating so a tampered state file with absurd note values can't
+        // overflow (debug panic / release wrap). Such values can't actually be
+        // spent — the proof binds each note's real value — but the sum stays sane.
         self.notes
             .iter()
             .filter(|n| !pending.contains(&n.nullifier))
             .map(|n| n.note.value().inner())
-            .sum()
+            .fold(0u64, |acc, v| acc.saturating_add(v))
     }
 
     /// Currently tracked unspent notes.
@@ -431,6 +434,13 @@ impl ShieldWallet {
     pub(crate) fn set_commitment_tree_for_test(&mut self, tree_hex: &str) {
         self.commitment_tree = tree_hex.to_string();
     }
+
+    /// Place the wallet at a synced height and skip checkpoint confirmation,
+    /// so a stub-node test can exercise the per-batch sync guards directly.
+    pub(crate) fn prime_for_sync_test(&mut self, height: i64) {
+        self.last_processed_block = height;
+        self.start_validated = true;
+    }
 }
 
 #[cfg(feature = "rpc")]
@@ -636,7 +646,14 @@ mod rpc_sync {
                     Ok(txid)
                 }
                 Err(err) => {
-                    self.discard_transaction(&tx.txid);
+                    // Only release the notes when the node definitively
+                    // rejected the transaction. On a transport error the node
+                    // may have accepted it, so keep the spend pending —
+                    // discarding could let a retry double-spend or an operator
+                    // double-pay. Recover per docs/deployment.md.
+                    if matches!(err, pivx_rpc::Error::Rpc { .. }) {
+                        self.discard_transaction(&tx.txid);
+                    }
                     Err(err.into())
                 }
             }

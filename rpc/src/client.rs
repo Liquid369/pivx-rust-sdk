@@ -54,8 +54,20 @@ pub struct PivxClient {
 
 impl PivxClient {
     /// `url` e.g. `"http://127.0.0.1:51473"`. For multiwallet nodes append
-    /// `/wallet/<name>` to route calls to a specific wallet.
+    /// `/wallet/<name>` to route calls to a specific wallet. Uses a 30-second
+    /// per-request timeout; see [`with_timeout`](Self::with_timeout) to change it.
     pub fn new(url: impl Into<String>, auth: Auth) -> Result<Self> {
+        Self::with_timeout(url, auth, std::time::Duration::from_secs(30))
+    }
+
+    /// Like [`new`](Self::new) with an explicit per-request timeout. A timeout
+    /// is essential in production: without one a hung or unresponsive node
+    /// blocks `call`/`sync`/`send` forever.
+    pub fn with_timeout(
+        url: impl Into<String>,
+        auth: Auth,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
         let auth = match auth {
             Auth::None => None,
             Auth::UserPass { user, pass } => Some((user, pass)),
@@ -68,7 +80,7 @@ impl PivxClient {
             }
         };
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder().timeout(timeout).build()?,
             url: url.into(),
             auth,
             id: AtomicU64::new(0),
@@ -163,6 +175,16 @@ impl PivxClient {
     pub async fn send_to_address(&self, address: &str, amount: f64) -> Result<String> {
         self.call("sendtoaddress", vec![json!(address), json!(amount)])
             .await
+    }
+
+    /// Wallet's record of a transaction (amounts, confirmations, fee, …).
+    pub async fn get_transaction(&self, txid: &str) -> Result<Value> {
+        self.call("gettransaction", vec![json!(txid)]).await
+    }
+
+    /// Validate an address; the result's `isvalid` field says whether it is.
+    pub async fn validate_address(&self, address: &str) -> Result<Value> {
+        self.call("validateaddress", vec![json!(address)]).await
     }
 
     pub async fn get_wallet_info(&self) -> Result<WalletInfo> {

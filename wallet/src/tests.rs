@@ -260,3 +260,96 @@ async fn wallet_creates_and_finalizes_spend() {
 fn wallet_set_tree_for_test(wallet: &mut ShieldWallet, tree_hex: &str) {
     wallet.set_commitment_tree_for_test(tree_hex);
 }
+
+/// Minimal loopback JSON-RPC stub: dispatches by method name, one canned
+/// result per method, serving requests until the client stops.
+#[cfg(feature = "rpc")]
+fn stub_node(results: std::collections::HashMap<&'static str, String>) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let method = results
+                .keys()
+                .find(|m| req.contains(&format!("\"method\":\"{m}\"")))
+                .copied()
+                .unwrap_or("");
+            let result = results
+                .get(method)
+                .cloned()
+                .unwrap_or_else(|| "null".into());
+            let body = format!("{{\"result\":{result},\"error\":null,\"id\":0}}");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    url
+}
+
+/// A lying node that echoes the wrong block height must be rejected before the
+/// wallet advances past real deposits.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_rejects_wrong_block_height() {
+    use pivx_rpc::{Auth, PivxClient};
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{}", BIRTH + 1));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // Requested height BIRTH+1, but the block claims a far-off height.
+    results.insert(
+        "getblock",
+        "{\"height\":999999,\"tx\":[],\"finalsaplingroot\":\"00\"}".to_string(),
+    );
+    let url = stub_node(results);
+
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.prime_for_sync_test(BIRTH);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let err = wallet.sync(&client, 10).await.unwrap_err();
+    assert!(
+        matches!(&err, WalletError::Other(m) if m.contains("block height")),
+        "got {err:?}"
+    );
+}
+
+/// A node that omits finalsaplingroot past activation must not let the wallet
+/// advance unverified.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_rejects_missing_sapling_root() {
+    use pivx_rpc::{Auth, PivxClient};
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{}", BIRTH + 1));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // Correct height, empty block, but no finalsaplingroot field.
+    results.insert(
+        "getblock",
+        format!("{{\"height\":{},\"tx\":[]}}", BIRTH + 1),
+    );
+    let url = stub_node(results);
+
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.prime_for_sync_test(BIRTH);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let err = wallet.sync(&client, 10).await.unwrap_err();
+    assert!(
+        matches!(&err, WalletError::Other(m) if m.contains("finalsaplingroot")),
+        "got {err:?}"
+    );
+}

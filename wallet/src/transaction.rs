@@ -45,6 +45,11 @@ pub const DEPTH: u8 = 32;
 /// Height passed to note decryption; PIVX constant inherited from upstream.
 const DECRYPT_HEIGHT: u32 = 320;
 
+/// A shielded note worth no more than this contributes no net value once its
+/// own input fee is paid (sapling input size 384 bytes × 1000 sats/byte), so
+/// it is never selected for spending. Prevents a dust-flood freeze.
+const DUST_NOTE_SATS: u64 = 384_000;
+
 /// A tracked shielded note in wire/persisted form (witness hex-serialized).
 /// Field names match the JS `pivx-wallet` state format.
 #[derive(Clone, Serialize, Deserialize)]
@@ -350,8 +355,16 @@ pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransacti
     }
 
     let input = if let Some(notes) = notes {
-        let mut notes: Vec<(Note, String)> =
-            notes.into_iter().map(|n| (n.note, n.witness)).collect();
+        // Skip notes worth no more than the marginal cost of spending one.
+        // They can never help selection reach amount+fee, they only inflate
+        // the fee, and admitting them lets an attacker freeze withdrawals by
+        // flooding the wallet with dust (each added input adds ~0 value and a
+        // full input's fee). Consolidating dust needs a dedicated sweep.
+        let mut notes: Vec<(Note, String)> = notes
+            .into_iter()
+            .filter(|n| n.note.value().inner() > DUST_NOTE_SATS)
+            .map(|n| (n.note, n.witness))
+            .collect();
         notes.sort_by_key(|(note, _)| note.value().inner());
         Either::Left(notes)
     } else if let Some(mut utxos) = utxos {
@@ -475,17 +488,17 @@ async fn create_transaction_internal(
                     .map(|m| m.encode())
                     .unwrap_or(MemoBytes::empty()),
             )
-            .map_err(|_| WalletError::Other("failed to add output".into()))?,
+            .map_err(|e| WalletError::Other(format!("failed to add output: {e:?}")))?,
     }
 
     if change.is_positive() {
         match decode_generic_address(network, change_address)? {
             GenericAddress::Transparent(x) => builder
                 .add_transparent_output(&x, change)
-                .map_err(|_| WalletError::Other("failed to add transparent change".into()))?,
+                .map_err(|e| WalletError::Other(format!("failed to add transparent change: {e:?}")))?,
             GenericAddress::Shield(x) => builder
                 .add_sapling_output::<FeeRule>(None, x, change, MemoBytes::empty())
-                .map_err(|_| WalletError::Other("failed to add shield change".into()))?,
+                .map_err(|e| WalletError::Other(format!("failed to add shield change: {e:?}")))?,
         }
     }
 
@@ -538,7 +551,7 @@ fn choose_utxos(
                     script_pubkey: Script(utxo.script.clone()),
                 },
             )
-            .map_err(|_| WalletError::Other("failed to use utxo".into()))?;
+            .map_err(|e| WalletError::Other(format!("failed to use utxo: {e:?}")))?;
         transparent_signing_set.add_key(key);
         transparent_input_count += 1;
         fee = fee_calculator(
@@ -582,7 +595,7 @@ fn choose_notes(
                     .path()
                     .ok_or_else(|| WalletError::Other("commitment tree is empty".into()))?,
             )
-            .map_err(|_| WalletError::Other("failed to add sapling spend".into()))?;
+            .map_err(|e| WalletError::Other(format!("failed to add sapling spend: {e:?}")))?;
         let nullifier = note.nf(
             &extsk
                 .to_diversifiable_full_viewing_key()

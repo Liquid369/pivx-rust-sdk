@@ -28,6 +28,19 @@ languages.
     `rawShieldSendMany`, `viewShieldTransaction`, `getSaplingNotesCount`.
   - Sapling keys: `exportSaplingKey`, `importSaplingKey`,
     `exportSaplingViewingKey`, `importSaplingViewingKey`.
+  - Masternodes: `getMasternodeCount`, `listMasternodes`,
+    `getMasternodeStatus`, `masternodeCurrent`; deterministic (evo)
+    `protxList`.
+  - Budget/governance: `getBudgetInfo`, `getBudgetProjection`.
+  - Staking: `getStakingStatus`, `listStakingAddresses`,
+    `getColdStakingBalance`.
+  - Net, mempool, mining, and util: `getPeerInfo`, `getConnectionCount`,
+    `getNetworkInfo`, `getMempoolInfo`, `getRawMempool`, `estimateFee`,
+    `estimateSmartFee`, `getMiningInfo`, `verifyMessage`, `getSupplyInfo`,
+    `getBlockIndexStats`.
+- Method names are camelCase in JS, snake_case in Rust
+  (`getMasternodeCount` / `get_masternode_count`). Typed methods cover the
+  common surface; the generic `call` still reaches any of the node's 224 RPCs.
 - `ShieldWatcher`: poll-based monitor over the node wallet's shielded notes.
   Emits new-note, spent, and balance-change events (JS `EventEmitter`; Rust
   returns events from `poll()` so the caller drives the cadence). Does not
@@ -117,6 +130,81 @@ broadcast relay.
 - One writer per wallet: Rust enforces this through `&mut`; JS guards sync
   and spend at runtime so overlapping calls fail fast instead of corrupting
   state.
+
+## pivx-wallet — transparent wallet
+
+A standalone HD wallet for PIVX's transparent (non-shielded, UTXO) funds —
+the transparent counterpart to the shield wallet above, built from the same
+kind of seed. No proving parameters are involved: transparent sends are plain
+ECDSA-signed legacy transactions. Amounts are integer satoshis.
+
+### Addressing and keys
+
+- BIP44 HD derivation, `m/44'/119'/account'/change/index` (PIVX coin type
+  119 mainnet, 1 testnet; `change` 0 = receive, 1 = internal change).
+  `deriveKey(seed, network, account, change, index)` returns the key pair,
+  its address, and a WIF at that path. (Rust: `derive_key`.)
+- `p2pkhAddress(pubkey, network)` turns a public key into its base58 address;
+  `encodeAddress(hash, network, kind)` / `decodeAddress(address)` round-trip a
+  raw hash160, and `isValidAddress(address)` validates. These are independent
+  of any wallet instance. (Rust: `p2pkh_address`, `encode_address`,
+  `decode_address`, `is_valid_address`.)
+- `decodeAddress` reports the address kind — P2PKH, P2SH, cold-staking, or
+  exchange — with its network. Rust models this as the `AddressKind` enum
+  (`P2pkh`, `P2sh`, `Staking`, `Exchange`).
+
+### TransparentWallet
+
+- `TransparentWallet.create(seed, network, account, gap)` derives `gap`
+  external and `gap` change addresses over one BIP44 account; only outputs to
+  those addresses are recognized. (Rust:
+  `TransparentWallet::new(seed, network, account, gap)`.)
+- `newAddress()` hands out the next unused external receive address, up to the
+  gap limit. (Rust: `new_address`.)
+- PIVX has no address index, so incoming coins are discovered two ways — both
+  supported:
+  - Block scan: `scanBlock(block)` credits the outputs of a decoded block
+    (`getblock <hash> 2`) that pay this wallet and drops UTXOs it spends;
+    `sync(client, { fromHeight, batchSize })` walks the chain from a height to
+    the tip and scans each block. (Rust: `scan_block`; `sync(client,
+    from_height, batch_size)`.)
+  - Caller-supplied: `addUtxo(txid, vout, amount, scriptPubKey)` registers a
+    UTXO you already know about (e.g. from your own indexer), returning whether
+    it pays this wallet. (Rust: `add_utxo`.)
+- `balance()` totals tracked unspent value in satoshis; JS `getUtxos()` /
+  Rust `utxos()` list the tracked outputs. (Rust: `balance`.)
+
+### Sending
+
+- `buildSend(to, amount, feePerByte)` selects UTXOs largest-first, builds and
+  ECDSA-signs a legacy (v1) transaction, and sends change to a fresh internal
+  change address. It returns the raw tx hex and the list of spent outputs
+  (`{ hex, spent }`; Rust: `build_send` → `(hex, spent)`). `feePerByte`
+  defaults to 100 sats/byte and the fee is size-based; amounts are satoshis.
+- Broadcast the hex through `pivx-rpc` (`sendRawTransaction`), then call
+  `markSpent(spent)` to drop the consumed UTXOs so a follow-up send cannot
+  reuse them before the spend confirms. (Rust: `mark_spent`.)
+- Coin selection rejects a send that cannot cover amount + fee rather than
+  underpaying. The send path is verified against real mainnet transactions.
+- `buildSend` validates the destination up front: it rejects an address from
+  the wrong network (a mainnet wallet will not build a send to a testnet
+  address, and vice versa), a cold-staking address, an `amount` below the
+  node's dust threshold (5460 sats for a standard output), and a non-positive
+  `feePerByte`. Change below the dust threshold is folded into the fee rather
+  than emitted as a dust output the node would reject.
+- Coinbase and coinstake outputs discovered by `scanBlock` are tracked with
+  their block height and are not selected for spending until they are
+  `nCoinbaseMaturity` blocks deep (100 mainnet, 15 testnet), matching the
+  node's maturity rule; caller-supplied UTXOs (`addUtxo`) are assumed mature.
+
+### Exchange addresses
+
+- PIVX exchange addresses (`EXM` on mainnet, `EXT` on testnet) are a
+  receive-only transparent variant. `decodeAddress` / `isValidAddress`
+  recognize and validate them (Rust: `AddressKind::Exchange`).
+- Sending to an exchange address is supported: the output is a standard P2PKH
+  script prefixed with `OP_EXCHANGEADDR` (`0xe0`), so `buildSend` accepts one
+  as a destination. (Sending to a cold-staking address is rejected.)
 
 ## Runtime notes
 

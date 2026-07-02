@@ -5,8 +5,8 @@ shielded (SHIELD/Sapling) support.
 
 | Crate | What it does |
 |---|---|
-| [`rpc/`](rpc/) — `pivx-rpc` | Typed async JSON-RPC client for `pivxd`: blockchain, wallet, full shield RPC surface, poll-based `ShieldWatcher`. |
-| [`wallet/`](wallet/) — `pivx-wallet` | **Standalone wallet: the application owns the keys.** ZIP32 derivation, block scanning with note decryption, checkpointed sync verified against `finalsaplingroot`, locally-proved shielded transactions (native speed). The node is only a chain-data source. |
+| [`rpc/`](rpc/) — `pivx-rpc` | Typed async JSON-RPC client for `pivxd`: blockchain, wallet, full shield RPC surface, plus masternode, staking, budget, and network dev-kit methods; poll-based `ShieldWatcher`. |
+| [`wallet/`](wallet/) — `pivx-wallet` | **Standalone wallet: the application owns the keys.** ZIP32 derivation, block scanning with note decryption, checkpointed sync verified against `finalsaplingroot`, locally-proved shielded transactions (native speed). Also a transparent (BIP44 HD, UTXO) wallet for non-shielded funds — block-scan or supplied-UTXO receive, ECDSA-signed legacy sends, exchange-address support. The node is only a chain-data source. |
 
 A wallet is constructed from a seed, spending key, **or viewing key** —
 watch-only is a capability level (scan/receive/balance, no spend),

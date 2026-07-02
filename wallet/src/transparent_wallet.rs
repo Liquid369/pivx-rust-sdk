@@ -13,7 +13,7 @@ use secp256k1::SecretKey;
 
 use crate::error::WalletError;
 use crate::transparent::{decode_address, derive_key, hash160, AddressKind};
-use crate::transparent_tx::{build_transparent_tx, TxInput, TxOutput};
+use crate::transparent_tx::{build_transparent_tx, script_pubkey_for_address, TxInput, TxOutput};
 
 /// A tracked unspent transparent output we can spend.
 #[derive(Clone)]
@@ -24,6 +24,29 @@ pub struct OwnedUtxo {
     pub script_pubkey: Vec<u8>,
     /// hash160 of the key that controls it (index into the key map).
     pub key_hash: [u8; 20],
+    /// True if this is a coinbase/coinstake output (spend-gated by maturity).
+    pub coinbase: bool,
+    /// Block height the output was confirmed at (0 if caller-supplied).
+    pub height: i64,
+}
+
+/// PIVX dust threshold (sats) for an output whose scriptPubKey is `script_len`
+/// bytes. Matches `GetDustThreshold` in src/policy/policy.cpp: the output plus
+/// the 148-byte input to spend it, priced at dustRelayFee = 30000 sat/kB. For
+/// our scripts (< 253 bytes) the CScript length prefix is one byte, so the
+/// serialized output is `8 + 1 + script_len`. A standard 25-byte P2PKH gives
+/// `(8+1+25+148) * 30000 / 1000 = 5460`.
+fn dust_threshold(script_len: usize) -> u64 {
+    (30_000 * (8 + 1 + script_len as u64 + 148)) / 1000
+}
+
+/// Coinbase/coinstake maturity in blocks (consensus.nCoinbaseMaturity,
+/// src/chainparams.cpp): mainnet 100, testnet 15.
+fn coinbase_maturity(network: Network) -> i64 {
+    match network {
+        Network::MainNetwork => 100,
+        Network::TestNetwork => 15,
+    }
 }
 
 /// A confirmed transparent output as seen in a scanned transaction.
@@ -121,8 +144,22 @@ impl TransparentWallet {
         }
     }
 
-    /// Add a caller-supplied UTXO if it pays one of our addresses.
+    /// Add a caller-supplied UTXO if it pays one of our addresses. Assumed a
+    /// normal (non-coinbase) spendable output; use `scan_block` for chain data
+    /// where coinbase maturity is tracked.
     pub fn add_utxo(&mut self, txid: &str, vout: u32, amount: u64, script_pubkey: Vec<u8>) -> bool {
+        self.insert_utxo(txid, vout, amount, script_pubkey, false, 0)
+    }
+
+    fn insert_utxo(
+        &mut self,
+        txid: &str,
+        vout: u32,
+        amount: u64,
+        script_pubkey: Vec<u8>,
+        coinbase: bool,
+        height: i64,
+    ) -> bool {
         match Self::p2pkh_hash(&script_pubkey) {
             Some(h) if self.keys.contains_key(&h) => {
                 self.utxos.insert(
@@ -133,6 +170,8 @@ impl TransparentWallet {
                         amount,
                         script_pubkey,
                         key_hash: h,
+                        coinbase,
+                        height,
                     },
                 );
                 true
@@ -160,6 +199,7 @@ impl TransparentWallet {
         if let Some(h) = block["height"].as_i64() {
             self.last_scanned = h;
         }
+        let height = self.last_scanned;
         let Some(txs) = block["tx"].as_array() else {
             return;
         };
@@ -167,6 +207,14 @@ impl TransparentWallet {
             let Some(txid) = tx["txid"].as_str() else {
                 continue;
             };
+            // Coinbase: first vin carries `coinbase` and no prevout. Coinstake
+            // (PoS): a spending vin plus an empty vout[0] (zero value). Both
+            // are maturity-gated for spending (src/txmempool.cpp).
+            let first_vin = tx["vin"].get(0);
+            let is_coinbase = first_vin.is_some_and(|v| v.get("coinbase").is_some());
+            let is_coinstake = first_vin.is_some_and(|v| v.get("txid").is_some())
+                && tx["vout"][0]["value"].as_f64() == Some(0.0);
+            let coinbase = is_coinbase || is_coinstake;
             for vout in tx["vout"].as_array().into_iter().flatten() {
                 let (Some(n), Some(value), Some(hex_str)) = (
                     vout["n"].as_u64(),
@@ -178,7 +226,14 @@ impl TransparentWallet {
                 let Ok(script) = hex::decode(hex_str) else {
                     continue;
                 };
-                self.add_utxo(txid, n as u32, (value * 1e8).round() as u64, script);
+                self.insert_utxo(
+                    txid,
+                    n as u32,
+                    (value * 1e8).round() as u64,
+                    script,
+                    coinbase,
+                    height,
+                );
             }
             for vin in tx["vin"].as_array().into_iter().flatten() {
                 // Coinbase vins have no prevout `txid`.
@@ -227,15 +282,39 @@ impl TransparentWallet {
                 "amount must be greater than zero".into(),
             ));
         }
+        let dest = decode_address(to)?;
+        // A mainnet wallet must not build a send to a testnet-encoded address
+        // (or vice versa): the 20-byte hash would be spent to this network's
+        // equivalent of it — a silent loss. Reject the mismatch up front.
+        if dest.network != self.network {
+            return Err(WalletError::Other(
+                "destination address is for a different network".into(),
+            ));
+        }
         // Reject cold-staking / unsupported destinations early.
-        if matches!(decode_address(to)?.kind, AddressKind::Staking) {
+        if matches!(dest.kind, AddressKind::Staking) {
             return Err(WalletError::Other(
                 "sending to a cold-staking address is not supported".into(),
             ));
         }
+        // Reject a recipient amount the node would drop as dust.
+        let to_script = script_pubkey_for_address(to)?;
+        if amount < dust_threshold(to_script.len()) {
+            return Err(WalletError::Other(
+                "amount is below the dust threshold".into(),
+            ));
+        }
         let feerate = fee_per_byte.unwrap_or(100);
 
-        let mut avail: Vec<&OwnedUtxo> = self.utxos.values().collect();
+        // Exclude immature coinbase/coinstake outputs: the node rejects a spend
+        // of one before nCoinbaseMaturity confirmations. Depth is measured
+        // against the last scanned block.
+        let maturity = coinbase_maturity(self.network);
+        let mut avail: Vec<&OwnedUtxo> = self
+            .utxos
+            .values()
+            .filter(|u| !(u.coinbase && self.last_scanned - u.height + 1 < maturity))
+            .collect();
         avail.sort_by_key(|u| std::cmp::Reverse(u.amount)); // largest first
 
         let mut selected: Vec<OwnedUtxo> = Vec::new();
@@ -258,9 +337,11 @@ impl TransparentWallet {
             address: to.to_string(),
             amount,
         }];
-        // Add change only if it is worth more than the extra input it would
-        // later cost to spend (dust threshold ~ one input's fee).
-        if change_val > feerate * 148 {
+        // Emit change only above both floors: the node's fixed dust threshold
+        // (else the whole tx is rejected as dust) and the fee to later spend
+        // the change input (else it is not economically worth keeping). Change
+        // is always P2PKH (25-byte script).
+        if change_val > std::cmp::max(feerate * 148, dust_threshold(25)) {
             let ch_hash = self.next_change_hash()?;
             let ch_addr =
                 crate::transparent::encode_address(&ch_hash, self.network, AddressKind::P2pkh);
@@ -415,5 +496,55 @@ mod tests {
             w.build_send(&dest, 100_000_000, Some(100)),
             Err(WalletError::InsufficientBalance)
         ));
+    }
+
+    #[test]
+    fn build_send_rejects_bad_destinations_and_dust() {
+        use pivx_primitives::consensus::Network::TestNetwork;
+        let seed = [5u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        w.add_utxo(
+            "cc".repeat(32).as_str(),
+            0,
+            200_000_000,
+            spk(&p2pkh_address(&a0.public_key, MainNetwork)),
+        );
+        // Wrong-network destination is rejected, not silently sent.
+        let testnet_dest = p2pkh_address(&a0.public_key, TestNetwork);
+        assert!(w.build_send(&testnet_dest, 100_000_000, Some(100)).is_err());
+        // Below the 5460-sat dust threshold is rejected.
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        assert!(w.build_send(&dest, 5000, Some(100)).is_err());
+        // At/above dust it builds.
+        assert!(w.build_send(&dest, 100_000_000, Some(100)).is_ok());
+    }
+
+    #[test]
+    fn immature_coinbase_is_not_spendable() {
+        let seed = [6u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        // Coinbase output at height 100.
+        let coinbase_block = serde_json::json!({
+            "height": 100,
+            "tx": [{
+                "txid": "dd".repeat(32),
+                "vin": [{ "coinbase": "00" }],
+                "vout": [{ "n": 0, "value": 5.0, "scriptPubKey": { "hex": spk_hex } }],
+            }],
+        });
+        w.scan_block(&coinbase_block);
+        assert_eq!(w.balance(), 500_000_000);
+        // Only 1 confirmation: immature, cannot be selected.
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        assert!(matches!(
+            w.build_send(&dest, 100_000_000, Some(100)),
+            Err(WalletError::InsufficientBalance)
+        ));
+        // Advance to maturity (100 confirmations): now spendable.
+        w.scan_block(&serde_json::json!({ "height": 199, "tx": [] }));
+        assert!(w.build_send(&dest, 100_000_000, Some(100)).is_ok());
     }
 }

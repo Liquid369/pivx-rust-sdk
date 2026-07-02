@@ -65,15 +65,18 @@ port.
 ```rust
 let height = client.get_block_count().await?;
 let balance = client.get_shield_balance("*", 1, false).await?;   // PIV
-let notes = client.list_shield_unspent(1, 9_999_999, false, None).await?;
+let mn_count = client.get_masternode_count().await?;             // masternode count
+let fee = client.estimate_smart_fee(6).await?;                   // smart fee estimate
 let addr = client.get_new_shield_address(None).await?;
 ```
 
-Anything not covered goes through `call`, with positional params exactly as
+Typed methods now reach the masternode, deterministic-masternode (`protx`),
+budget, staking, and network/mempool/mining/util surface as well. Anything
+still not wrapped goes through `call`, with positional params exactly as
 `pivx-cli` would take them:
 
 ```rust
-let count: i64 = client.call("getmasternodecount", vec![]).await?;
+let tips: serde_json::Value = client.call("getchaintips", vec![]).await?;
 ```
 
 Node errors surface as `Error::Rpc { code, message, .. }` with the node's
@@ -319,3 +322,80 @@ Unit-test against fixtures the way this repo's own tests do
 (`wallet/src/tests.rs`). For end-to-end validation run a regtest node, mine
 past the sapling activation height, and drive real deposits and sends;
 nothing else exercises consensus acceptance of locally-built transactions.
+
+## Transparent wallet
+
+`pivx-wallet` also manages PIVX's transparent (non-shielded, UTXO) funds,
+separately from the shield wallet. Transparent sends are plain ECDSA-signed
+legacy transactions — no proving parameters. Amounts are integer satoshis,
+same as the shield wallet.
+
+### Addressing
+
+```rust
+use pivx_wallet::{decode_address, derive_key, is_valid_address, p2pkh_address, AddressKind, Network};
+
+// BIP44 m/44'/119'/account'/change/index — change 0 = receive, 1 = internal
+let key = derive_key(&seed, Network::MainNetwork, 0, 0, 0)?;
+let addr = key.address();                       // "D..."  (also key.wif())
+
+assert!(is_valid_address(&addr));
+match decode_address(&addr)?.kind {
+    AddressKind::P2pkh => { /* standard */ }
+    AddressKind::Exchange => { /* EXM / EXT */ }
+    AddressKind::Staking | AddressKind::P2sh => { /* ... */ }
+}
+```
+
+### Creating and receiving
+
+PIVX has no address index, so a transparent wallet learns about incoming
+coins two ways — scan the chain, or hand it UTXOs you already know about.
+
+```rust
+use pivx_wallet::TransparentWallet;
+
+let mut wallet = TransparentWallet::new(&seed, Network::MainNetwork, 0, 100)?;  // account 0, gap 100
+let addr = wallet.new_address()?;               // fresh receive address per deposit
+
+// (a) scan the chain
+wallet.sync(&client, 4_800_000, 100).await?;    // from_height, batch_size
+// or feed one decoded block (getblock <hash> 2) from your own source:
+wallet.scan_block(&block);
+
+// (b) or register a UTXO yourself; returns false if it isn't ours
+wallet.add_utxo(&txid, vout, 200_000_000, script_pubkey);
+
+wallet.balance();                                // sats (u64)
+wallet.utxos().collect::<Vec<_>>();              // tracked unspent outputs
+```
+
+### Sending
+
+```rust
+let (hex, spent) = wallet.build_send("D...recipient", 150_000_000, Some(100))?;  // 100 sats/byte
+client.send_raw_transaction(&hex).await?;
+wallet.mark_spent(&spent);                       // only after a successful broadcast
+```
+
+`build_send` selects UTXOs largest-first, signs locally (ECDSA), sizes the
+fee from `fee_per_byte` (defaults to 100 when `None`), and sends change to a
+fresh internal address. It errors if funds can't cover amount + fee rather
+than underpaying. Call `mark_spent(&spent)` only once the broadcast succeeds
+— until then the UTXOs stay spendable, so a failed broadcast can be retried.
+This send path is verified against real mainnet transactions.
+
+### Exchange addresses
+
+Exchange addresses (`EXM` mainnet, `EXT` testnet) are a receive-only
+transparent variant, reported as `AddressKind::Exchange`. Validate them and
+send to them like any address; the output carries an `OP_EXCHANGEADDR` prefix
+on an otherwise standard P2PKH script.
+
+```rust
+assert!(is_valid_address("EXM..."));
+assert_eq!(decode_address("EXM...")?.kind, AddressKind::Exchange);
+let (hex, spent) = wallet.build_send("EXM...", 150_000_000, Some(100))?;
+```
+
+Sending to a cold-staking address is rejected.

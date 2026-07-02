@@ -37,6 +37,7 @@ mod prover;
 mod testnet_checkpoints;
 mod transaction;
 mod transparent;
+mod transparent_tx;
 mod wallet;
 
 #[cfg(test)]
@@ -61,4 +62,5 @@ pub use transparent::{
     decode_address, derive_key, hash160, is_valid_address, p2pkh_address, AddressKind,
     DecodedAddress, TransparentKey,
 };
+pub use transparent_tx::{build_transparent_tx, script_pubkey_for_address, TxInput, TxOutput};
 pub use wallet::{AttributedNote, Inputs, SendOptions, ShieldWallet, WalletBlock};

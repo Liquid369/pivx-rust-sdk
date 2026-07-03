@@ -9,13 +9,20 @@ languages.
 
 - Typed JSON-RPC client for `pivxd` over HTTP.
 - Authentication by RPC user/password or by the datadir `.cookie` file
-  (Rust: `Auth::CookieFile`; JS: pass the parsed credentials).
+  (Rust: `Auth::CookieFile`; JS: `PivxClient.fromCookie(path)`). Both SDKs
+  auto-refresh on HTTP 401: the cookie is re-read and the request retried
+  once if pivxd rotated it on restart. A 403 is an IP/ACL denial a cookie
+  can't fix, so it is not retried.
 - Multiwallet routing via the `/wallet/<name>` URL path.
-- Configurable request timeout; response-size cap to protect against a
-  hostile node returning an oversized body (JS).
+- Configurable request timeout; response-size cap (default 64 MiB;
+  `with_max_response_size` in Rust, `maxResponseBytes` in JS) to protect
+  against a hostile node returning an oversized body.
 - Errors separate the node's own JSON-RPC error (with its numeric code)
   from transport failures, so callers can retry connection errors without
-  retrying rejected requests.
+  retrying rejected requests. A failed HTTP 401/403 is its own matchable
+  error (JS `AuthError`; Rust `Error::Auth { status }`), distinct from an
+  oversized body (Rust `Error::ResponseTooLarge`) and other non-2xx HTTP
+  responses without a JSON-RPC error body (Rust `Error::Http`).
 - Generic `call(method, params)` escape hatch for any RPC not wrapped below.
 - Typed methods:
   - Blockchain: `getBlockCount`, `getBestBlockHash`, `getBlockHash`,
@@ -90,6 +97,10 @@ broadcast relay.
   outputs without touching wallet state, for mempool hints (does not validate
   the transaction).
 - Nullifier → note attribution lookup, for reconciling spends.
+- Sub-dust notes (≤ 384000 sats, never spendable) are purged from tracked
+  state on every scan pass and skipped in nullifier attribution, so a dust
+  flood cannot grow wallet state without bound. Both SDKs use the same
+  threshold.
 
 ### Spending
 
@@ -114,6 +125,11 @@ broadcast relay.
   - JavaScript: single-core WASM by default; opt-in multicore WASM with a
     configurable thread count for browsers (needs cross-origin isolation).
   - Rust: native proving (fast; the right choice for server-side throughput).
+    `send()` runs the multi-second proof on `tokio::task::spawn_blocking`, so
+    it does not block the async runtime's worker threads. `create_transaction`
+    proves inline (CPU-blocking) for callers that broadcast themselves; on an
+    async runtime, wrap it in `spawn_blocking` yourself. Server callers should
+    prefer `send()`.
 
 ### Persistence and recovery
 
@@ -125,12 +141,24 @@ broadcast relay.
 - `sync` raises a divergence error (`ScanDivergedError` /
   `WalletError::ScanDiverged`) if the local tree stops matching the node,
   instead of corrupting witnesses.
+- `pruneNullifiers()` / `prune_nullifiers()`: opt-in, returns the count
+  removed. Drops nullifier → note attribution entries for notes that are
+  neither tracked-unspent nor pending, bounding a map that otherwise keeps one
+  entry per note ever received. Pruned nullifiers can no longer be attributed,
+  so call it only after reconciling the spends you care about. Deterministic
+  across both SDKs; the save/load format is unchanged.
 
 ### Concurrency
 
 - One writer per wallet: Rust enforces this through `&mut`; JS guards sync
   and spend at runtime so overlapping calls fail fast instead of corrupting
   state.
+- Cancellable sync (JS): `PivxWallet.sync` and `TransparentWallet.sync` accept
+  an `AbortSignal` in their options. Aborting throws (`signal.reason` ??
+  `AbortError`) at a batch boundary, leaving state consistent — only fully
+  applied, root-verified batches are kept — and releases the busy guard so a
+  later sync resumes where this one stopped. Rust cancels the same work by
+  dropping the `sync` future.
 
 ## pivx-wallet — transparent wallet
 

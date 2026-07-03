@@ -27,6 +27,17 @@ pub enum Error {
         message: String,
         method: String,
     },
+    /// HTTP 401/403 from the node: bad rpcuser/rpcpassword, or a stale
+    /// `.cookie` (pivxd regenerates it on every restart).
+    #[error("authentication failed (HTTP {status}): check RPC credentials or cookie file")]
+    Auth { status: u16 },
+    /// Non-2xx HTTP response without a JSON-RPC error body.
+    #[error("{method}: node returned HTTP {status} with no JSON-RPC error body")]
+    Http { status: u16, method: String },
+    /// Response body exceeded the configured cap; see
+    /// [`with_max_response_size`](PivxClient::with_max_response_size).
+    #[error("{method}: response body exceeds {limit}-byte cap")]
+    ResponseTooLarge { method: String, limit: usize },
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
     #[error("invalid response for {method}: {source}")]
@@ -42,13 +53,41 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Default cap on HTTP response bodies (matches the JS client).
+const DEFAULT_MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
+
+/// A real pivxd `.cookie` is `__cookie__:<hex>` — well under 256 bytes. Cap the
+/// read so a wrong path at a huge file can't be slurped into memory.
+const MAX_COOKIE_BYTES: u64 = 4096;
+
+fn read_cookie(path: &std::path::Path) -> Result<(String, String)> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_COOKIE_BYTES + 1)
+        .read_to_string(&mut buf)?;
+    if buf.len() as u64 > MAX_COOKIE_BYTES {
+        return Err(Error::InvalidCookie("cookie file is too large".into()));
+    }
+    let (user, pass) = buf
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| Error::InvalidCookie("cookie file has no ':' separator".into()))?;
+    Ok((user.to_string(), pass.to_string()))
+}
+
 /// Async JSON-RPC client for a pivxd node.
 ///
 /// Default ports: mainnet `51473`, testnet `51475`.
 pub struct PivxClient {
     http: reqwest::Client,
     url: String,
-    auth: Option<(String, String)>,
+    /// Current basic-auth credentials. Behind a lock so a rotated `.cookie`
+    /// can be re-read on 401 without `&mut self` (client stays Send + Sync).
+    auth: std::sync::RwLock<Option<(String, String)>>,
+    /// Set only for [`Auth::CookieFile`]: where to re-read credentials from.
+    cookie_path: Option<PathBuf>,
+    max_response_size: usize,
     id: AtomicU64,
 }
 
@@ -68,23 +107,78 @@ impl PivxClient {
         auth: Auth,
         timeout: std::time::Duration,
     ) -> Result<Self> {
-        let auth = match auth {
-            Auth::None => None,
-            Auth::UserPass { user, pass } => Some((user, pass)),
-            Auth::CookieFile(path) => {
-                let contents = std::fs::read_to_string(path)?;
-                let (user, pass) = contents.trim().split_once(':').ok_or_else(|| {
-                    Error::InvalidCookie("cookie file has no ':' separator".into())
-                })?;
-                Some((user.to_string(), pass.to_string()))
-            }
+        let (auth, cookie_path) = match auth {
+            Auth::None => (None, None),
+            Auth::UserPass { user, pass } => (Some((user, pass)), None),
+            Auth::CookieFile(path) => (Some(read_cookie(&path)?), Some(path)),
         };
         Ok(Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
             url: url.into(),
-            auth,
+            auth: std::sync::RwLock::new(auth),
+            cookie_path,
+            max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
             id: AtomicU64::new(0),
         })
+    }
+
+    /// Cap on HTTP response body size in bytes (default 64 MiB). Responses
+    /// exceeding it abort with [`Error::ResponseTooLarge`].
+    /// Builder-style: `PivxClient::new(url, auth)?.with_max_response_size(n)`.
+    pub fn with_max_response_size(mut self, bytes: usize) -> Self {
+        self.max_response_size = bytes;
+        self
+    }
+
+    /// POST `payload` with the current credentials.
+    async fn post(&self, payload: &Value) -> Result<reqwest::Response> {
+        let req = {
+            let auth = self.auth.read().unwrap();
+            let mut req = self.http.post(&self.url).json(payload);
+            if let Some((user, pass)) = auth.as_ref() {
+                req = req.basic_auth(user, Some(pass));
+            }
+            req // guard drops here, before the await
+        };
+        Ok(req.send().await?)
+    }
+
+    /// After a 401: re-read the cookie file. Returns true if the credentials
+    /// on disk changed (and were swapped in), so the request should be
+    /// retried once. False if not cookie-authed or the cookie is unchanged.
+    fn refresh_cookie(&self) -> Result<bool> {
+        let Some(path) = &self.cookie_path else {
+            return Ok(false);
+        };
+        let fresh = read_cookie(path)?;
+        let mut auth = self.auth.write().unwrap();
+        if auth.as_ref() == Some(&fresh) {
+            return Ok(false);
+        }
+        *auth = Some(fresh);
+        Ok(true)
+    }
+
+    /// Read the body, aborting once it exceeds `max_response_size`.
+    async fn read_body_capped(&self, mut resp: reqwest::Response, method: &str) -> Result<Vec<u8>> {
+        let too_large = || Error::ResponseTooLarge {
+            method: method.to_string(),
+            limit: self.max_response_size,
+        };
+        if resp
+            .content_length()
+            .is_some_and(|len| len > self.max_response_size as u64)
+        {
+            return Err(too_large());
+        }
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if buf.len() + chunk.len() > self.max_response_size {
+                return Err(too_large());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     /// Raw JSON-RPC call. Trailing `Value::Null` params are trimmed so
@@ -97,16 +191,44 @@ impl PivxClient {
         while params.last() == Some(&Value::Null) {
             params.pop();
         }
-        let mut req = self.http.post(&self.url).json(&json!({
+        let payload = json!({
             "jsonrpc": "1.0",
             "id": self.id.fetch_add(1, Ordering::Relaxed),
             "method": method,
             "params": params,
-        }));
-        if let Some((user, pass)) = &self.auth {
-            req = req.basic_auth(user, Some(pass));
+        });
+        let mut resp = self.post(&payload).await?;
+        // pivxd regenerates `.cookie` on every restart: on 401, re-read it and
+        // retry once if the credentials actually changed. A 403 is an IP/ACL
+        // denial that a cookie can't fix, so it is not retried. An unreadable
+        // cookie counts as unchanged and falls through to Error::Auth (the
+        // caller's actionable signal is that authentication failed).
+        if resp.status().as_u16() == 401 && self.refresh_cookie().unwrap_or(false) {
+            resp = self.post(&payload).await?;
         }
-        let body: Value = req.send().await?.json().await?;
+        let status = resp.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(Error::Auth { status });
+        }
+        let is_success = resp.status().is_success();
+        let bytes = self.read_body_capped(resp, method).await?;
+        // pivxd (src/httprpc.cpp JSONErrorReply) reports RPC errors as
+        // non-2xx *with* a JSON-RPC error body: prefer that error if present.
+        let body: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(source) if is_success => {
+                return Err(Error::Json {
+                    method: method.to_string(),
+                    source,
+                })
+            }
+            Err(_) => {
+                return Err(Error::Http {
+                    status,
+                    method: method.to_string(),
+                })
+            }
+        };
         if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
             return Err(Error::Rpc {
                 code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
@@ -115,6 +237,12 @@ impl PivxClient {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown RPC error")
                     .to_string(),
+                method: method.to_string(),
+            });
+        }
+        if !is_success {
+            return Err(Error::Http {
+                status,
                 method: method.to_string(),
             });
         }
@@ -278,6 +406,9 @@ impl PivxClient {
                 json!(from.into().as_str()),
                 json!(recipients),
                 json!(min_conf),
+                // fee=0 is identical to omitting the param: pivxd computes the
+                // minimum fee (src/wallet/rpcwallet.cpp, "If nFee=0 leave the
+                // default"). A null here would be rejected by AmountFromValue.
                 json!(fee.unwrap_or(0.0)),
                 json!(subtract_fee_from),
             ],

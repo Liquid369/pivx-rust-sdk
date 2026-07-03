@@ -31,6 +31,26 @@ pub(crate) fn get_loaded_prover() -> Option<&'static ImplTxProver> {
     PROVER.get()
 }
 
+/// Test-only configurable proving cost for the MockProver: the proving step
+/// sleeps this long, simulating the multi-second CPU-bound Groth16 work so
+/// tests can assert it runs off the async runtime.
+#[cfg(test)]
+static MOCK_PROVE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_mock_prove_delay_ms(ms: u64) {
+    MOCK_PROVE_DELAY_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Applied at the start of the proving step (`transaction::prove_transaction`).
+#[cfg(test)]
+pub(crate) fn apply_mock_prove_delay() {
+    let ms = MOCK_PROVE_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 pub fn prover_is_loaded() -> bool {
     PROVER.initialized()
 }

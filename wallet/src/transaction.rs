@@ -47,8 +47,10 @@ const DECRYPT_HEIGHT: u32 = 320;
 
 /// A shielded note worth no more than this contributes no net value once its
 /// own input fee is paid (sapling input size 384 bytes × 1000 sats/byte), so
-/// it is never selected for spending. Prevents a dust-flood freeze.
-const DUST_NOTE_SATS: u64 = 384_000;
+/// it is never selected for spending and is purged from tracked wallet state
+/// on every scan pass. Prevents a dust-flood freeze. Same threshold as the
+/// JS SDK's `DUST_NOTE_SATS`.
+pub(crate) const DUST_NOTE_SATS: u64 = 384_000;
 
 /// A tracked shielded note in wire/persisted form (witness hex-serialized).
 /// Field names match the JS `pivx-wallet` state format.
@@ -337,7 +339,20 @@ pub struct TxOptions<'a> {
 }
 
 /// Build and prove a transaction. Inputs are consumed smallest-first.
+///
+/// Proving is multi-second CPU-bound Groth16 work and runs inline here: the
+/// returned future blocks its executor thread until the proof completes.
+/// Async servers should prefer [`crate::ShieldWallet`]'s `send` (which proves
+/// on a blocking thread) or run this future on a dedicated thread themselves.
+#[cfg_attr(not(test), allow(dead_code))] // kept as the documented inline-proving path
 pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransaction, WalletError> {
+    plan_transaction(options)?.prove()
+}
+
+/// Fast planning phase: validate, select inputs smallest-first, and assemble
+/// the unproven transaction. Returns an owned, CPU-only [`ProvingJob`] so the
+/// caller decides where the multi-second proving runs.
+pub(crate) fn plan_transaction(options: TxOptions<'_>) -> Result<ProvingJob, WalletError> {
     let TxOptions {
         notes,
         utxos,
@@ -383,7 +398,7 @@ pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransacti
         return Err(WalletError::Other("no inputs provided".into()));
     };
 
-    create_transaction_internal(TxInternalArgs {
+    plan_transaction_internal(TxInternalArgs {
         inputs: input,
         extsk,
         to_address,
@@ -394,7 +409,6 @@ pub async fn create_transaction(options: TxOptions<'_>) -> Result<BuiltTransacti
         memo,
         subtract_fee_from_amount,
     })
-    .await
 }
 
 struct TxInternalArgs<'a> {
@@ -409,9 +423,7 @@ struct TxInternalArgs<'a> {
     subtract_fee_from_amount: bool,
 }
 
-async fn create_transaction_internal(
-    args: TxInternalArgs<'_>,
-) -> Result<BuiltTransaction, WalletError> {
+fn plan_transaction_internal(args: TxInternalArgs<'_>) -> Result<ProvingJob, WalletError> {
     let TxInternalArgs {
         inputs,
         extsk,
@@ -513,16 +525,42 @@ async fn create_transaction_internal(
         }
     }
 
-    let prover = get_loaded_prover().ok_or(WalletError::ProverNotLoaded)?;
-    prove_transaction(
+    Ok(ProvingJob {
         builder,
-        extsk.clone(),
-        &transparent_signing_set,
+        extsk: extsk.clone(),
+        transparent_keys: transparent_signing_set,
         nullifiers,
         fee,
-        prover,
-    )
-    .map_err(WalletError::from)
+    })
+}
+
+/// A planned, unproven transaction: everything the Groth16 proving step
+/// needs, owned and detached from the wallet, so the CPU-bound work can run
+/// on a dedicated (blocking) thread while the wallet stays usable.
+pub(crate) struct ProvingJob {
+    builder: Builder<'static, Network, ()>,
+    extsk: ExtendedSpendingKey,
+    transparent_keys: TransparentSigningSet,
+    nullifiers: Vec<String>,
+    fee: u64,
+}
+
+// `ShieldWallet::send` proves on the tokio blocking pool, which requires the
+// job to be self-contained and sendable; this stops compiling if a refactor
+// makes it borrow.
+const _: () = {
+    const fn assert_send<T: Send + 'static>() {}
+    assert_send::<ProvingJob>();
+};
+
+impl ProvingJob {
+    /// Prove and sign: CPU-only Groth16 work that blocks the calling thread
+    /// for seconds with the real prover. On an async runtime, run it via
+    /// `tokio::task::spawn_blocking`.
+    pub(crate) fn prove(self) -> Result<BuiltTransaction, WalletError> {
+        let prover = get_loaded_prover().ok_or(WalletError::ProverNotLoaded)?;
+        prove_transaction(self, prover).map_err(WalletError::from)
+    }
 }
 
 fn choose_utxos(
@@ -680,15 +718,22 @@ fn fee_calculator(
 }
 
 fn prove_transaction(
-    builder: Builder<'_, Network, impl ProverProgress>,
-    extsk: ExtendedSpendingKey,
-    transparent_keys: &TransparentSigningSet,
-    nullifiers: Vec<String>,
-    fee: u64,
+    job: ProvingJob,
     prover: &crate::prover::ImplTxProver,
 ) -> Result<BuiltTransaction, Box<dyn Error>> {
-    let result = builder.build(
+    let ProvingJob {
+        builder,
+        extsk,
         transparent_keys,
+        nullifiers,
+        fee,
+    } = job;
+    // Simulated proving cost so tests can assert this step stays off the
+    // async runtime (see prover::set_mock_prove_delay_ms).
+    #[cfg(test)]
+    crate::prover::apply_mock_prove_delay();
+    let result = builder.build(
+        &transparent_keys,
         &[extsk],
         &[],
         OsRng,

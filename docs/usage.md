@@ -56,6 +56,11 @@ let client = PivxClient::new(
 )?;
 ```
 
+pivxd rewrites the cookie on every restart. With `Auth::CookieFile`, an HTTP
+401 makes the client re-read the file and retry the request once if the
+credentials changed, so a node restart doesn't require rebuilding the client.
+A 403 (an IP/ACL denial a cookie can't fix) is not retried.
+
 For multiwallet nodes append `/wallet/<name>` to the URL. There is no TLS:
 run the node on localhost or tunnel the connection; do not expose the RPC
 port.
@@ -81,7 +86,10 @@ let tips: serde_json::Value = client.call("getchaintips", vec![]).await?;
 
 Node errors surface as `Error::Rpc { code, message, .. }` with the node's
 own code; transport failures are `Error::Transport`, so retry logic can
-tell them apart:
+tell them apart. An HTTP 401/403 that survives the cookie refresh is
+`Error::Auth { status }` — a distinct variant, so a credentials problem is
+matchable rather than retried (an oversized body is `Error::ResponseTooLarge`
+and other non-2xx responses without a JSON-RPC error body are `Error::Http`):
 
 ```rust
 match client.shield_send_many(FromAddress::AnyShield, &recipients).await {
@@ -212,7 +220,11 @@ default) provides `sync` and `send`; disable it to bring your own
 transport.
 
 Rust's borrow rules prevent concurrent syncs on one wallet. Keep it that
-way across tasks: one wallet, one writer.
+way across tasks: one wallet, one writer. To cancel a long sync, drop its
+future — e.g. wrap the call in `tokio::time::timeout` or race it in a
+`select!`. Cancellation lands at an `.await` between batches, so the state
+kept is the last fully applied, root-verified batch; call `sync` again to
+resume. (The JS SDK exposes the same via an `AbortSignal` option.)
 
 ### Detecting deposits
 
@@ -278,7 +290,9 @@ let txid = wallet.send(&client, &SendOptions {
 ```
 
 `send` builds and proves locally, broadcasts through the client, and
-settles the pending state. To broadcast yourself:
+settles the pending state. On an async server prefer it: `send` runs the
+multi-second proof on `tokio::task::spawn_blocking`, so it does not block the
+runtime's worker threads. To broadcast yourself:
 
 ```rust
 let tx = wallet.create_transaction(&opts).await?;
@@ -323,7 +337,10 @@ Inputs::Transparent {
 
 Proving is native and takes a few seconds per transaction on server
 hardware. Build with `--release`; debug-profile proving is an order of
-magnitude slower.
+magnitude slower. Unlike `send`, `create_transaction` proves inline and
+blocks its executor thread for the duration (documented on the method); if
+you call it on an async runtime, wrap it in `tokio::task::spawn_blocking`
+yourself, or run it on a dedicated thread.
 
 ### Testing your integration
 

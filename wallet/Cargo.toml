@@ -1,6 +1,6 @@
 [package]
 name = "pivx-wallet"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source."
@@ -18,8 +18,9 @@ all-features = true
 
 [features]
 default = ["rpc"]
-# Chain sync via a pivxd node using the pivx-rpc crate.
-rpc = ["dep:pivx-rpc"]
+# Chain sync via a pivxd node using the pivx-rpc crate. tokio/rt is API-only
+# (no runtime pulled in): send() proves via tokio::task::spawn_blocking.
+rpc = ["dep:pivx-rpc", "tokio/rt"]
 
 [dependencies]
 pivx-rpc = { path = "../rpc", optional = true }
@@ -49,4 +50,4 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

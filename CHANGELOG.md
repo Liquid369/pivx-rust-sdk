@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-03
+
+### Added
+
+- `pivx-wallet`: `prune_nullifiers()` — opt-in, drops nullifier-attribution
+  entries for notes that are neither tracked-unspent nor pending; call after
+  reconciling. Sub-dust notes (≤ 384000 sats) are now also skipped in
+  attribution and purged from tracked state, bounding growth under a dust flood
+  (parity with the JS SDK).
+- `pivx-rpc`: cookie-file auth now re-reads `.cookie` and retries once on HTTP
+  401 when the credentials rotated (node restart); a 403 is not retried.
+- `pivx-rpc`: `Error::Auth` (HTTP 401/403), `Error::Http`, and
+  `Error::ResponseTooLarge` as distinct, matchable errors; response bodies are
+  capped (default 64 MiB, `with_max_response_size`).
+
+### Changed
+
+- `pivx-wallet`: `ShieldWallet::send()` now runs Groth16 proving on
+  `tokio::task::spawn_blocking`, so a send no longer stalls the async runtime.
+  `create_transaction` still proves inline (CPU-blocking) for callers that
+  broadcast themselves — wrap it in `spawn_blocking` on an async runtime.
+- `pivx-rpc`: `ShieldWatcher` balance-change detection compares integer
+  satoshis (round-then-sum), matching the JS SDK, so floating-point note
+  amounts cannot fire a spurious balance event.
+
 ## [0.2.0] - 2026-07-02
 
 ### Added

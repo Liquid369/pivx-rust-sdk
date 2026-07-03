@@ -29,11 +29,18 @@ pub struct WatchOptions {
     pub exclude_watch_only: bool,
 }
 
+/// PIV → integer sats, so balance change detection is immune to f64
+/// summation noise (events still carry the PIV f64 values).
+fn to_sats(piv: f64) -> i64 {
+    (piv * 1e8).round() as i64
+}
+
 /// Diffable note-set state: the first `apply` primes without events.
 #[derive(Default)]
 struct NoteDiff {
     notes: HashMap<(String, u32), ShieldNote>,
     balance: f64,
+    balance_sats: i64,
     primed: bool,
 }
 
@@ -44,6 +51,10 @@ impl NoteDiff {
             .map(|n| ((n.txid.clone(), n.outindex), n))
             .collect();
         let balance: f64 = current.values().map(|n| n.amount).sum();
+        // Round each note to sats then sum (not sum-then-round): summing exact
+        // per-note integers avoids f64 accumulation error, and matches the JS
+        // SDK so both fire Balance on exactly the same data.
+        let balance_sats: i64 = current.values().map(|n| to_sats(n.amount)).sum();
 
         let mut events = Vec::new();
         if self.primed {
@@ -57,7 +68,7 @@ impl NoteDiff {
                     events.push(ShieldEvent::Spent(note.clone()));
                 }
             }
-            if balance != self.balance {
+            if balance_sats != self.balance_sats {
                 events.push(ShieldEvent::Balance {
                     current: balance,
                     previous: self.balance,
@@ -66,6 +77,7 @@ impl NoteDiff {
         }
         self.notes = current;
         self.balance = balance;
+        self.balance_sats = balance_sats;
         self.primed = true;
         events
     }
@@ -178,5 +190,33 @@ mod tests {
         assert!(diff
             .apply(vec![note("t2", 0, 3.0), note("t3", 1, 4.0)])
             .is_empty());
+    }
+
+    #[test]
+    fn fp_noise_does_not_fire_balance() {
+        let mut diff = NoteDiff::default();
+        diff.apply(vec![note("t1", 0, 0.1), note("t2", 0, 0.2)]);
+
+        // 0.1 + 0.2 != 0.3 in f64, but both are 30_000_000 sats: the note
+        // churn fires Note/Spent events, but no Balance event.
+        let events = diff.apply(vec![note("t3", 0, 0.3)]);
+        assert_eq!(events.len(), 3);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, ShieldEvent::Balance { .. })));
+    }
+
+    #[test]
+    fn balance_change_is_round_then_sum_matching_js() {
+        // Round each note to sats then sum (not sum-then-round): 1.0 -> the
+        // split 0.999999995 + 0.000000005 rounds to 100000000 + 1 = 100000001,
+        // a genuine 1-sat change, so Balance fires — same as the JS SDK on the
+        // same data. (Reachable only if a node emits sub-satoshi amounts.)
+        let mut diff = NoteDiff::default();
+        diff.apply(vec![note("t1", 0, 1.0)]);
+        let events = diff.apply(vec![note("t2", 0, 0.999999995), note("t3", 0, 0.000000005)]);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ShieldEvent::Balance { .. })));
     }
 }

@@ -279,6 +279,60 @@ fn wallet_set_tree_for_test(wallet: &mut ShieldWallet, tree_hex: &str) {
     wallet.set_commitment_tree_for_test(tree_hex);
 }
 
+/// Sub-dust notes are purged from tracked state on every scan pass (dust-flood
+/// defense; JS SDK parity), even when they arrived via load() of an older save.
+#[test]
+fn scan_purges_dust_notes_from_tracked_state() {
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.handle_blocks(&fixture_block()).unwrap();
+
+    // Shrink the tracked note to exactly the dust threshold via the persisted
+    // state, as an old save carrying a sub-dust note would.
+    let mut state: serde_json::Value = serde_json::from_str(&wallet.save().unwrap()).unwrap();
+    state["notes"][0]["note"]["value"] = 384_000.into();
+    let mut wallet = ShieldWallet::load(&state.to_string()).unwrap();
+    assert_eq!(wallet.balance(), 384_000, "dust note loads");
+
+    // Any scan pass purges it, even one with no wallet-relevant transactions.
+    wallet
+        .handle_blocks(&[WalletBlock {
+            height: BIRTH + 2,
+            tx_hexes: vec![],
+        }])
+        .unwrap();
+    assert_eq!(wallet.notes().len(), 0, "dust purged on scan");
+    assert_eq!(wallet.balance(), 0);
+}
+
+/// prune_nullifiers drops exactly the entries referenced by neither a tracked
+/// unspent note nor a pending spend.
+#[test]
+fn prunes_only_unreferenced_nullifiers() {
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.handle_blocks(&fixture_block()).unwrap();
+    let nullifier = wallet.notes()[0].nullifier.clone();
+
+    // Entry backed by a tracked note: kept.
+    assert_eq!(wallet.prune_nullifiers(), 0);
+    assert!(wallet.note_from_nullifier(&nullifier).is_some());
+
+    // Craft a state where the note is gone but its spend is still pending,
+    // plus a stale entry referenced by nothing.
+    let mut state: serde_json::Value = serde_json::from_str(&wallet.save().unwrap()).unwrap();
+    state["notes"] = serde_json::json!([]);
+    state["pendingSpends"] = serde_json::json!({ "sometxid": [nullifier] });
+    state["nullifierMap"]["00ff"] = serde_json::json!({ "recipient": "x", "value": 1 });
+    let mut wallet = ShieldWallet::load(&state.to_string()).unwrap();
+
+    assert_eq!(wallet.prune_nullifiers(), 1, "only the stale entry goes");
+    assert!(wallet.note_from_nullifier("00ff").is_none());
+    assert!(
+        wallet.note_from_nullifier(&nullifier).is_some(),
+        "pending-spend attribution survives"
+    );
+    assert_eq!(wallet.prune_nullifiers(), 0, "idempotent");
+}
+
 /// Minimal loopback JSON-RPC stub: dispatches by method name, one canned
 /// result per method, serving requests until the client stops.
 #[cfg(feature = "rpc")]
@@ -370,4 +424,73 @@ async fn sync_rejects_missing_sapling_root() {
         matches!(&err, WalletError::Other(m) if m.contains("finalsaplingroot")),
         "got {err:?}"
     );
+}
+
+/// send() must prove on the blocking pool, not the async runtime. On a
+/// single-threaded runtime a 10ms ticker task runs concurrently with send();
+/// if the 300ms (mock-delayed) proof ran inline on the worker thread the
+/// ticker could not advance. Control: the sync-proving create_transaction on
+/// the same runtime does block, so the ticker stands still.
+#[cfg(feature = "rpc")]
+#[tokio::test(flavor = "current_thread")]
+async fn send_proves_off_the_async_runtime() {
+    use pivx_rpc::{Auth, PivxClient};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    crate::prover::load_prover_from_bytes(&[], &[])
+        .await
+        .unwrap();
+    crate::prover::set_mock_prove_delay_ms(300);
+
+    let make_wallet = || {
+        let mut w = ShieldWallet::from_spending_key(TX2_EXTSK, TestNetwork, BIRTH).unwrap();
+        wallet_set_tree_for_test(&mut w, TX2_TREE);
+        w.handle_blocks(&[WalletBlock {
+            height: BIRTH + 1,
+            tx_hexes: vec![TX2_INPUT_TX.to_string()],
+        }])
+        .unwrap();
+        w
+    };
+    let send_opts = || SendOptions::shield("yAHuqx6mZMAiPKeV35C11Lfb3Pqxdsru5D", 5 * 10e6 as u64);
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let ticker = {
+        let counter = counter.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // Positive: the worker thread stays live while send() proves.
+    let mut results = std::collections::HashMap::new();
+    results.insert("sendrawtransaction", "\"aa11\"".to_string());
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    let mut wallet = make_wallet();
+    let before = counter.load(Ordering::Relaxed);
+    wallet.send(&client, &send_opts()).await.unwrap();
+    let ticks = counter.load(Ordering::Relaxed) - before;
+    assert!(
+        ticks >= 10,
+        "runtime was blocked during send: {ticks} ticks over a 300ms prove"
+    );
+
+    // Control: inline proving blocks the only worker thread, so the ticker
+    // cannot advance during create_transaction.
+    let mut wallet = make_wallet();
+    let before = counter.load(Ordering::Relaxed);
+    wallet.create_transaction(&send_opts()).await.unwrap();
+    let ticks = counter.load(Ordering::Relaxed) - before;
+    assert!(
+        ticks < 5,
+        "create_transaction unexpectedly yielded during proving: {ticks} ticks"
+    );
+
+    ticker.abort();
+    crate::prover::set_mock_prove_delay_ms(0);
 }

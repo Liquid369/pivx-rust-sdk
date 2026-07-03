@@ -229,6 +229,28 @@ impl ShieldWallet {
         self.nullifier_map.get(nullifier)
     }
 
+    /// Drop every nullifier-map entry not referenced by a currently tracked
+    /// unspent note or by a pending spend, returning how many were removed.
+    ///
+    /// The map keeps one entry per note ever received so that
+    /// [`note_from_nullifier`](Self::note_from_nullifier) can attribute
+    /// spends; left alone it grows forever. Pruning is explicit and opt-in:
+    /// pruned nullifiers can no longer be attributed, so callers that use
+    /// nullifier→note attribution for reconciliation should call this only
+    /// AFTER reconciling. Deterministic — the same wallet state prunes to the
+    /// same result here and in the JS SDK. Save/load format is unchanged.
+    pub fn prune_nullifiers(&mut self) -> usize {
+        let referenced: HashSet<&String> = self
+            .notes
+            .iter()
+            .map(|n| &n.nullifier)
+            .chain(self.pending_spends.values().flatten())
+            .collect();
+        let before = self.nullifier_map.len();
+        self.nullifier_map.retain(|nf, _| referenced.contains(nf));
+        before - self.nullifier_map.len()
+    }
+
     // ── Scanning ────────────────────────────────────────────────────────
 
     /// Scan blocks (strictly ascending heights, all above the last synced
@@ -264,6 +286,13 @@ impl ShieldWallet {
 
         self.commitment_tree = result.commitment_tree;
         for n in &result.new_notes {
+            // Skip sub-dust notes (same gate as the JS SDK and as the tracked-
+            // note purge below): a dust note is never spendable, so keeping its
+            // attribution would only let a dust flood grow nullifier_map without
+            // bound between prune_nullifiers() calls.
+            if n.note.value().inner() <= transaction::DUST_NOTE_SATS {
+                continue;
+            }
             let addr = sapling::PaymentAddress::from_bytes(&n.note.recipient().to_bytes())
                 .map(|a| keys::encode_payment_address(&a, self.network))
                 .unwrap_or_default();
@@ -276,11 +305,19 @@ impl ShieldWallet {
             );
         }
         let spent: HashSet<&String> = result.spent_nullifiers.iter().collect();
+        // Purge sub-dust notes from tracked state on every scan pass — not
+        // only newly decrypted ones — so a dust flood can't grow state or
+        // per-block witness cost, and a state carrying dust (e.g. loaded from
+        // an older save) converges with the JS SDK after one sync. Same
+        // threshold as spend selection; the commitments stay in the tree.
         self.notes = result
             .notes
             .into_iter()
             .chain(result.new_notes)
-            .filter(|n| !spent.contains(&n.nullifier))
+            .filter(|n| {
+                !spent.contains(&n.nullifier)
+                    && n.note.value().inner() > transaction::DUST_NOTE_SATS
+            })
             .collect();
         // Drop pending-spend entries whose notes are now gone (their tx
         // confirmed and was scanned out), so pending_spends can't leak.
@@ -305,7 +342,22 @@ impl ShieldWallet {
     /// Build and prove a transaction locally. Nothing is broadcast; spent
     /// notes are held pending until [`finalize_transaction`](Self::finalize_transaction)
     /// or [`discard_transaction`](Self::discard_transaction).
+    ///
+    /// Proving is multi-second CPU-bound Groth16 work and runs inline: this
+    /// future blocks its executor thread until the proof completes. On an
+    /// async server prefer `send` (rpc feature), which proves on a blocking
+    /// thread — or run this future on a dedicated thread yourself.
     pub async fn create_transaction(&mut self, opts: &SendOptions) -> Result<BuiltTransaction> {
+        let job = self.plan_transaction(opts)?;
+        let built = job.prove()?;
+        self.track_pending_spend(opts, &built);
+        Ok(built)
+    }
+
+    /// Fast planning phase (guards, input selection, change address). Returns
+    /// an owned CPU-only proving job so the caller decides where the
+    /// multi-second proving runs.
+    fn plan_transaction(&mut self, opts: &SendOptions) -> Result<transaction::ProvingJob> {
         if self.extsk.is_none() {
             return Err(WalletError::NoSpendAuthority);
         }
@@ -331,7 +383,7 @@ impl ShieldWallet {
         };
         let extsk = self.extsk.as_ref().expect("checked above");
 
-        let built = transaction::create_transaction(TxOptions {
+        transaction::plan_transaction(TxOptions {
             notes,
             utxos,
             extsk,
@@ -343,13 +395,15 @@ impl ShieldWallet {
             memo: opts.memo.clone().unwrap_or_default(),
             subtract_fee_from_amount: opts.subtract_fee_from_amount,
         })
-        .await?;
+    }
 
+    /// Pending-spend bookkeeping once a transaction is built: shield inputs
+    /// hold their notes pending until finalize/discard.
+    fn track_pending_spend(&mut self, opts: &SendOptions, built: &BuiltTransaction) {
         if matches!(opts.inputs, Inputs::Shield) {
             self.pending_spends
                 .insert(built.txid.clone(), built.nullifiers.clone());
         }
-        Ok(built)
     }
 
     /// Mark a broadcast transaction's notes as spent.
@@ -679,8 +733,16 @@ mod rpc_sync {
         }
 
         /// Build, broadcast, and finalize in one step.
+        ///
+        /// The CPU-bound proving step runs via `tokio::task::spawn_blocking`,
+        /// so the runtime's worker threads stay live for other tasks during
+        /// the multi-second proof.
         pub async fn send(&mut self, client: &PivxClient, opts: &SendOptions) -> Result<String> {
-            let tx = self.create_transaction(opts).await?;
+            let job = self.plan_transaction(opts)?;
+            let tx = tokio::task::spawn_blocking(move || job.prove())
+                .await
+                .map_err(|e| WalletError::Other(format!("proving task failed: {e}")))??;
+            self.track_pending_spend(opts, &tx);
             match client.send_raw_transaction(&tx.txhex).await {
                 Ok(txid) => {
                     self.finalize_transaction(&tx.txid);

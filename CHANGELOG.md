@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-03
+
+### Added
+
+- `pivx-rpc`: typed return structs for 12 methods that previously returned
+  `serde_json::Value` — `get_network_info`, `get_peer_info`, `get_mempool_info`,
+  `get_raw_mempool` (+ new `get_raw_mempool_verbose`), `get_supply_info`,
+  `get_block_index_stats`, `get_mining_info`, `estimate_smart_fee`,
+  `get_budget_info`, `get_budget_projection`, `get_staking_status`,
+  `list_staking_addresses`. Each struct keeps a `#[serde(flatten)]` catch-all so
+  unmodeled node fields are preserved.
+- `pivx-rpc`: `PivxClient` is now cheaply `Clone` — clones share the connection
+  pool, request-id counter, and credential store, so a `.cookie` refresh on one
+  clone is visible to all (convenient for sharing across tokio tasks).
+
+### Changed
+
+- `pivx-rpc`: the `Error` enum is `#[non_exhaustive]`; match it with a `_ =>`
+  arm. The three masternode methods stay `serde_json::Value` on purpose — their
+  shape is polymorphic and cannot be typed safely.
+- `pivx-rpc`: request JSON now serializes object keys in declaration order
+  (`serde_json` `preserve_order`); omitted optional params on `list_transactions`
+  et al. and on `import_sapling_key`/`import_sapling_viewing_key`/`protx_list`
+  are sent as the node's defaults, never a null the node would reject.
+
+### Notes
+
+- `pivx-rpc` is at 0.4.0 (its own semver). Return-type changes and the
+  `#[non_exhaustive]` error are breaking, hence the minor bump.
+
 ## [0.4.0] - 2026-07-03
 
 ### Added

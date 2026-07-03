@@ -512,3 +512,275 @@ async fn call_batch_empty_slice_is_rejected() {
         "expected invalid-request Rpc error, got {err:?}"
     );
 }
+
+// ── v0.5 typed returns ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn parses_network_info_with_nested_and_extra() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"version":5030000,"subversion":"/PIVX:5.3.0/","protocolversion":70927,
+            "localservices":"0000000000000005","timeoffset":0,"networkactive":true,"connections":8,
+            "networks":[{"name":"ipv4","limited":false,"reachable":true,"proxy":"",
+                "proxy_randomize_credentials":false}],
+            "relayfee":0.00001,"localaddresses":[{"address":"1.2.3.4","port":51472,"score":1}],
+            "warnings":"","futurefield":42},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let ni = client.get_network_info().await.unwrap();
+    assert_eq!(ni.version, 5030000);
+    assert_eq!(ni.connections, Some(8));
+    assert_eq!(ni.networks[0].name, "ipv4");
+    assert_eq!(ni.localaddresses[0].port, 51472);
+    assert_eq!(
+        ni.extra.get("futurefield").and_then(|v| v.as_i64()),
+        Some(42)
+    );
+}
+
+#[tokio::test]
+async fn parses_peer_info_optionals_and_permsg_maps() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":[{"id":1,"addr":"1.2.3.4:51472","services":"5","lastsend":1,"lastrecv":2,
+            "bytessent":100,"bytesrecv":200,"conntime":3,"timeoffset":0,"pingtime":0.05,
+            "version":70927,"subver":"/PIVX/","inbound":false,"addnode":false,"masternode":false,
+            "startingheight":1000,"whitelisted":false,
+            "bytessent_per_msg":{"ping":32},"bytesrecv_per_msg":{"pong":32}}],"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let peers = client.get_peer_info().await.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].id, 1);
+    assert_eq!(peers[0].addrlocal, None);
+    assert_eq!(peers[0].synced_headers, None);
+    assert_eq!(peers[0].bytessent_per_msg.get("ping"), Some(&32));
+}
+
+#[tokio::test]
+async fn parses_raw_mempool_verbose_descendantfees_raw_i64() {
+    // descendantfees is raw satoshis (i64), while fee/modifiedfee are PIV f64.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"abcd":{"size":200,"fee":0.0001,"modifiedfee":0.0001,"time":1600000000,
+            "height":1000,"descendantcount":1,"descendantsize":200,"descendantfees":10000,
+            "depends":[]}},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let m = client.get_raw_mempool_verbose().await.unwrap();
+    let e = m.get("abcd").unwrap();
+    assert_eq!(e.fee, 0.0001);
+    assert_eq!(e.descendantfees, 10000);
+    assert!(e.depends.is_empty());
+}
+
+#[tokio::test]
+async fn parses_raw_mempool_nonverbose_sends_false() {
+    let (url, handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":["tx1","tx2"],"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let txids = client.get_raw_mempool().await.unwrap();
+    assert_eq!(txids, vec!["tx1".to_string(), "tx2".to_string()]);
+    let request = handle.join().unwrap().remove(0);
+    assert!(
+        request.contains(r#""method":"getrawmempool""#) && request.contains(r#""params":[false]"#),
+        "non-verbose must send [false]: {request}"
+    );
+}
+
+#[tokio::test]
+async fn parses_block_index_stats_string_money_and_space_keys() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"Starting block":100,"Ending block":200,"txcount":50,"txcount_all":52,
+            "txbytes":12345,"ttlfee":"1.23456789","feeperkb":"0.00010000"},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let s = client.get_block_index_stats(200, 100).await.unwrap();
+    assert_eq!(s.starting_block, 100);
+    assert_eq!(s.ending_block, 200);
+    assert_eq!(s.ttlfee, "1.23456789");
+    assert_eq!(s.feeperkb, "0.00010000");
+}
+
+#[tokio::test]
+async fn parses_mining_info_errors_and_warnings() {
+    // Normal mode emits both errors and warnings.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"blocks":1000,"currentblocksize":0,"currentblocktx":0,"difficulty":1.5,
+            "genproclimit":-1,"networkhashps":1234.5,"pooledtx":3,"testnet":false,"chain":"main",
+            "errors":"","warnings":"heads up"},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let mi = client.get_mining_info().await.unwrap();
+    assert_eq!(mi.genproclimit, -1);
+    assert_eq!(mi.errors, "");
+    assert_eq!(mi.warnings.as_deref(), Some("heads up"));
+    assert_eq!(mi.generate, None);
+}
+
+#[tokio::test]
+async fn parses_estimate_smart_fee_sentinel() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"feerate":-1.0,"blocks":6},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let f = client.estimate_smart_fee(6).await.unwrap();
+    assert_eq!(f.feerate, -1.0);
+    assert_eq!(f.blocks, 6);
+}
+
+#[tokio::test]
+async fn parses_budget_projection_flatten() {
+    // BudgetProjection = BudgetProposal fields (flattened) + TotalBudgetAllotted.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":[{"Name":"prop","URL":"http://x","Hash":"h","FeeHash":"fh","BlockStart":100,
+            "BlockEnd":200,"TotalPaymentCount":3,"RemainingPaymentCount":2,"PaymentAddress":"D1",
+            "Ratio":1.0,"Yeas":10,"Nays":1,"Abstains":0,"TotalPayment":300.0,"MonthlyPayment":100.0,
+            "IsEstablished":true,"IsValid":true,"Allotted":100.0,
+            "TotalBudgetAllotted":100.0}],"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let p = client.get_budget_projection().await.unwrap();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].proposal.name, "prop");
+    assert_eq!(p[0].proposal.monthly_payment, 100.0);
+    assert_eq!(p[0].proposal.is_invalid_reason, None);
+    assert_eq!(p[0].total_budget_allotted, 100.0);
+}
+
+#[tokio::test]
+async fn parses_staking_status_optional_lastattempt() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"staking_status":true,"staking_enabled":true,"coldstaking_enabled":false,
+            "haveconnections":true,"mnsync":true,"walletunlocked":true,"stakeablecoins":5,
+            "stakingbalance":123.0,"stakesplitthreshold":500.0},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let s = client.get_staking_status().await.unwrap();
+    assert!(s.staking_status);
+    assert_eq!(s.stakeablecoins, 5);
+    assert_eq!(s.lastattempt_age, None);
+}
+
+// ── v0.5 stability: Clone + interior-null wire fixes ─────────────────────
+
+#[tokio::test]
+async fn cloned_client_shares_auth_state() {
+    // A cookie refresh triggered by a 401 on one clone must be visible to the
+    // other, because both share the same Arc<RwLock> of credentials.
+    let (url, handle) = stub_node(vec![
+        http("401 Unauthorized", ""), // c2 first try (stale)
+        http("200 OK", r#"{"result":42,"error":null,"id":0}"#), // c2 retry (fresh)
+        http("200 OK", r#"{"result":7,"error":null,"id":0}"#), // c1 call (must be fresh)
+    ]);
+    let path = temp_cookie("cloneshare", "u:old");
+    let c1 = PivxClient::new(url, Auth::CookieFile(path.clone())).unwrap();
+    let c2 = c1.clone();
+
+    // Rotate the cookie on disk, then let c2 hit the 401 → refresh shared auth.
+    std::fs::write(&path, "u:new").unwrap();
+    assert_eq!(c2.get_block_count().await.unwrap(), 42);
+    // c1 shares the Arc, so it now uses the refreshed creds without its own 401.
+    assert_eq!(c1.get_block_count().await.unwrap(), 7);
+    std::fs::remove_file(&path).ok();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0].contains("Basic dTpvbGQ="),
+        "c2 first should be stale"
+    );
+    assert!(
+        requests[1].contains("Basic dTpuZXc="),
+        "c2 retry should be fresh"
+    );
+    assert!(
+        requests[2].contains("Basic dTpuZXc="),
+        "c1 must see c2's refresh via shared auth: {}",
+        requests[2]
+    );
+}
+
+#[tokio::test]
+async fn import_sapling_key_height_without_rescan_no_interior_null() {
+    let (url, handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"address":"ps1abc"},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let imported = client
+        .import_sapling_key("skey", None, Some(30000))
+        .await
+        .unwrap();
+    assert_eq!(imported.address, "ps1abc");
+    let request = handle.join().unwrap().remove(0);
+    // rescan default substituted (never a null before the height param).
+    assert!(
+        request.contains(r#""params":["skey","whenkeyisnew",30000]"#),
+        "must substitute rescan default, no interior null: {request}"
+    );
+}
+
+#[tokio::test]
+async fn import_sapling_viewing_key_wire_forms() {
+    let (url, handle) = stub_node(vec![
+        http(
+            "200 OK",
+            r#"{"result":{"address":"a1"},"error":null,"id":0}"#,
+        ),
+        http(
+            "200 OK",
+            r#"{"result":{"address":"a2"},"error":null,"id":1}"#,
+        ),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    // Both None → just the key (trailing trimmed).
+    client
+        .import_sapling_viewing_key("vk", None, None)
+        .await
+        .unwrap();
+    // Height only → default rescan substituted, no interior null.
+    client
+        .import_sapling_viewing_key("vk", None, Some(5))
+        .await
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert!(
+        requests[0].contains(r#""params":["vk"]"#),
+        "both None → [vk]: {}",
+        requests[0]
+    );
+    assert!(
+        requests[1].contains(r#""params":["vk","whenkeyisnew",5]"#),
+        "height only → default rescan, no null: {}",
+        requests[1]
+    );
+}
+
+#[tokio::test]
+async fn protx_list_method_name_and_defaults_not_null() {
+    let (url, handle) = stub_node(vec![http("200 OK", r#"{"result":[],"error":null,"id":0}"#)]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    // height set but the earlier bools omitted: they must become concrete
+    // defaults, never nulls.
+    client
+        .protx_list(None, None, None, Some(200000))
+        .await
+        .unwrap();
+    let request = handle.join().unwrap().remove(0);
+    assert!(
+        request.contains(r#""method":"protx_list""#),
+        "wire method is protx_list (flat command), not a subcommand: {request}"
+    );
+    assert!(
+        request.contains(r#""params":[true,false,false,200000]"#),
+        "protx_list must send node defaults, no interior null: {request}"
+    );
+}

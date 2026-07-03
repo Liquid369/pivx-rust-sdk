@@ -20,6 +20,7 @@ pub enum Auth {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Error returned by the node's JSON-RPC layer, code intact (e.g. -13 = wallet locked).
     #[error("{method}: {message} (code {code})")]
@@ -93,16 +94,23 @@ fn read_cookie(path: &std::path::Path) -> Result<(String, String)> {
 /// Async JSON-RPC client for a pivxd node.
 ///
 /// Default ports: mainnet `51473`, testnet `51475`.
+///
+/// Cheap to [`Clone`]: every clone shares the same reqwest connection pool,
+/// request-id counter, and — crucially — the same `Arc<RwLock>` of credentials,
+/// so a `.cookie` refresh triggered by a 401 on one clone is immediately
+/// visible to all others.
+#[derive(Clone)]
 pub struct PivxClient {
     http: reqwest::Client,
     url: String,
-    /// Current basic-auth credentials. Behind a lock so a rotated `.cookie`
-    /// can be re-read on 401 without `&mut self` (client stays Send + Sync).
-    auth: std::sync::RwLock<Option<(String, String)>>,
+    /// Current basic-auth credentials. Behind a shared lock so a rotated
+    /// `.cookie` can be re-read on 401 without `&mut self` (client stays
+    /// Send + Sync) and the refresh is shared across clones.
+    auth: std::sync::Arc<std::sync::RwLock<Option<(String, String)>>>,
     /// Set only for [`Auth::CookieFile`]: where to re-read credentials from.
     cookie_path: Option<PathBuf>,
     max_response_size: usize,
-    id: AtomicU64,
+    id: std::sync::Arc<AtomicU64>,
 }
 
 impl PivxClient {
@@ -129,10 +137,10 @@ impl PivxClient {
         Ok(Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
             url: url.into(),
-            auth: std::sync::RwLock::new(auth),
+            auth: std::sync::Arc::new(std::sync::RwLock::new(auth)),
             cookie_path,
             max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
-            id: AtomicU64::new(0),
+            id: std::sync::Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -722,17 +730,25 @@ impl PivxClient {
             .await
     }
 
+    /// Import a sapling spending key. `rescan`: `"yes"` | `"no"` |
+    /// `"whenkeyisnew"` (default). `height` rescans from that block.
     pub async fn import_sapling_key(
         &self,
         key: &str,
         rescan: Option<&str>,
         height: Option<i64>,
     ) -> Result<ImportedSaplingKey> {
-        self.call(
-            "importsaplingkey",
-            vec![json!(key), json!(rescan), json!(height)],
-        )
-        .await
+        // params[1] (rescan) is read with get_str() and params[2] (height)
+        // with get_int() — both reject a null. When height is given without
+        // rescan, substitute the node default so no interior null is sent.
+        let mut params = vec![json!(key)];
+        if rescan.is_some() || height.is_some() {
+            params.push(json!(rescan.unwrap_or("whenkeyisnew")));
+        }
+        if let Some(h) = height {
+            params.push(json!(h));
+        }
+        self.call("importsaplingkey", params).await
     }
 
     pub async fn export_sapling_viewing_key(&self, shield_addr: &str) -> Result<String> {
@@ -748,11 +764,17 @@ impl PivxClient {
         rescan: Option<&str>,
         height: Option<i64>,
     ) -> Result<ImportedSaplingKey> {
-        self.call(
-            "importsaplingviewingkey",
-            vec![json!(vkey), json!(rescan), json!(height)],
-        )
-        .await
+        // Same null-guarding as importsaplingkey: rescan via get_str(), height
+        // via get_int(); substitute the node default for rescan when only
+        // height is supplied so no interior null precedes it.
+        let mut params = vec![json!(vkey)];
+        if rescan.is_some() || height.is_some() {
+            params.push(json!(rescan.unwrap_or("whenkeyisnew")));
+        }
+        if let Some(h) = height {
+            params.push(json!(h));
+        }
+        self.call("importsaplingviewingkey", params).await
     }
 
     // ── Masternode ───────────────────────────────────────────────────────
@@ -762,16 +784,22 @@ impl PivxClient {
     }
 
     /// Legacy masternode list; `filter` matches address/txhash/status/etc.
+    /// Returns the node's raw JSON; shape varies (deterministic vs legacy) and
+    /// can be a string on edge cases.
     pub async fn list_masternodes(&self, filter: Option<&str>) -> Result<Value> {
         self.call("listmasternodes", vec![json!(filter)]).await
     }
 
     /// This node's masternode status (errors if the node isn't a masternode).
+    /// Returns the node's raw JSON; shape varies (deterministic vs legacy) and
+    /// can be a string on edge cases.
     pub async fn get_masternode_status(&self) -> Result<Value> {
         self.call("getmasternodestatus", vec![]).await
     }
 
     /// The masternode currently scheduled to be paid.
+    /// Returns the node's raw JSON; shape varies (deterministic vs legacy) and
+    /// can be a string on edge cases.
     pub async fn masternode_current(&self) -> Result<Value> {
         self.call("masternodecurrent", vec![]).await
     }
@@ -779,6 +807,10 @@ impl PivxClient {
     // ── Deterministic MN (evo) ───────────────────────────────────────────
 
     /// Deterministic masternode list. All args optional (node defaults).
+    ///
+    /// The wire method is `protx_list` (a flat command in PIVX's evo RPC
+    /// table, `src/rpc/rpcevo.cpp`), not a `protx` command with a `list`
+    /// subcommand.
     pub async fn protx_list(
         &self,
         detailed: Option<bool>,
@@ -786,36 +818,38 @@ impl PivxClient {
         valid_only: Option<bool>,
         height: Option<i64>,
     ) -> Result<Value> {
-        self.call(
-            "protx_list",
-            vec![
-                json!(detailed),
-                json!(wallet_only),
-                json!(valid_only),
-                json!(height),
-            ],
-        )
-        .await
+        // Every positional arg is read with an unguarded get_bool()/get_int(),
+        // so a null (from an omitted Option before a present one) is rejected —
+        // substitute the node's own defaults. height is trailing/optional.
+        let mut params = vec![
+            json!(detailed.unwrap_or(true)),
+            json!(wallet_only.unwrap_or(false)),
+            json!(valid_only.unwrap_or(false)),
+        ];
+        if let Some(h) = height {
+            params.push(json!(h));
+        }
+        self.call("protx_list", params).await
     }
 
     // ── Budget / governance ──────────────────────────────────────────────
 
     /// Budget proposal(s); `name` limits the result to one proposal.
-    pub async fn get_budget_info(&self, name: Option<&str>) -> Result<Value> {
+    pub async fn get_budget_info(&self, name: Option<&str>) -> Result<Vec<BudgetProposal>> {
         self.call("getbudgetinfo", vec![json!(name)]).await
     }
 
-    pub async fn get_budget_projection(&self) -> Result<Value> {
+    pub async fn get_budget_projection(&self) -> Result<Vec<BudgetProjection>> {
         self.call("getbudgetprojection", vec![]).await
     }
 
     // ── Staking / cold-staking (wallet) ──────────────────────────────────
 
-    pub async fn get_staking_status(&self) -> Result<Value> {
+    pub async fn get_staking_status(&self) -> Result<StakingStatus> {
         self.call("getstakingstatus", vec![]).await
     }
 
-    pub async fn list_staking_addresses(&self) -> Result<Value> {
+    pub async fn list_staking_addresses(&self) -> Result<Vec<StakingAddress>> {
         self.call("liststakingaddresses", vec![]).await
     }
 
@@ -825,7 +859,7 @@ impl PivxClient {
 
     // ── Network / mempool / mining / util ────────────────────────────────
 
-    pub async fn get_peer_info(&self) -> Result<Value> {
+    pub async fn get_peer_info(&self) -> Result<Vec<PeerInfo>> {
         self.call("getpeerinfo", vec![]).await
     }
 
@@ -833,17 +867,25 @@ impl PivxClient {
         self.call("getconnectioncount", vec![]).await
     }
 
-    pub async fn get_network_info(&self) -> Result<Value> {
+    pub async fn get_network_info(&self) -> Result<NetworkInfo> {
         self.call("getnetworkinfo", vec![]).await
     }
 
-    pub async fn get_mempool_info(&self) -> Result<Value> {
+    pub async fn get_mempool_info(&self) -> Result<MempoolInfo> {
         self.call("getmempoolinfo", vec![]).await
     }
 
-    /// `verbose` false = array of txids, true = object keyed by txid.
-    pub async fn get_raw_mempool(&self, verbose: Option<bool>) -> Result<Value> {
-        self.call("getrawmempool", vec![json!(verbose)]).await
+    /// Txids currently in the mempool. For per-tx metadata use the verbose
+    /// variant [`get_raw_mempool_verbose`](Self::get_raw_mempool_verbose).
+    pub async fn get_raw_mempool(&self) -> Result<Vec<String>> {
+        self.call("getrawmempool", vec![json!(false)]).await
+    }
+
+    /// Verbose `getrawmempool`: a map keyed by txid with per-tx metadata.
+    /// Polymorphic like `getrawtransaction` — the non-verbose form is
+    /// [`get_raw_mempool`](Self::get_raw_mempool).
+    pub async fn get_raw_mempool_verbose(&self) -> Result<HashMap<String, MempoolEntry>> {
+        self.call("getrawmempool", vec![json!(true)]).await
     }
 
     /// Estimated fee-per-kB for confirmation within `nblocks`; -1 if unknown.
@@ -851,12 +893,12 @@ impl PivxClient {
         self.call("estimatefee", vec![json!(nblocks)]).await
     }
 
-    /// `{ feerate, blocks }`; feerate is -1 if not enough data.
-    pub async fn estimate_smart_fee(&self, nblocks: i64) -> Result<Value> {
+    /// `{ feerate, blocks }`; `feerate` is `-1.0` if not enough data.
+    pub async fn estimate_smart_fee(&self, nblocks: i64) -> Result<EstimateSmartFee> {
         self.call("estimatesmartfee", vec![json!(nblocks)]).await
     }
 
-    pub async fn get_mining_info(&self) -> Result<Value> {
+    pub async fn get_mining_info(&self) -> Result<MiningInfo> {
         self.call("getmininginfo", vec![]).await
     }
 
@@ -875,12 +917,12 @@ impl PivxClient {
     }
 
     /// Coin supply totals (transparent + shield). `force_update` recomputes.
-    pub async fn get_supply_info(&self, force_update: Option<bool>) -> Result<Value> {
+    pub async fn get_supply_info(&self, force_update: Option<bool>) -> Result<SupplyInfo> {
         self.call("getsupplyinfo", vec![json!(force_update)]).await
     }
 
     /// Aggregate stats over `range` blocks ending at `height`.
-    pub async fn get_block_index_stats(&self, height: i64, range: i64) -> Result<Value> {
+    pub async fn get_block_index_stats(&self, height: i64, range: i64) -> Result<BlockIndexStats> {
         self.call("getblockindexstats", vec![json!(height), json!(range)])
             .await
     }

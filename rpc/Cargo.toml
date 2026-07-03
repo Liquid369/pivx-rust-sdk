@@ -1,6 +1,6 @@
 [package]
 name = "pivx-rpc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 description = "PIVX SDK: typed JSON-RPC client with shielded (SHIELD/Sapling) balance watching and transaction support"
@@ -16,7 +16,9 @@ all-features = true
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: serialize request JSON object keys in declaration order for
+# cross-SDK (Rust/JS) wire parity.
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 
 [dev-dependencies]

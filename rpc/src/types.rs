@@ -3,6 +3,8 @@
 //! Amounts are `f64` in PIV (8 decimal places), exactly as the node emits
 //! them — the same convention as every *-core RPC library.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -453,4 +455,262 @@ pub struct ValidateAddress {
     // Shield-address fields:
     pub diversifier: Option<String>,
     pub diversifiedtransmissionkey: Option<String>,
+}
+
+// ── Typed RPC returns (v0.5) ─────────────────────────────────────────────
+//
+// Volatile node-status objects: every struct carries a `#[serde(flatten)]
+// extra` catch-all so a node adding a field never breaks deserialization.
+// Amounts are `f64` PIV; "moneystr" fields (FormatMoney) stay `String`.
+
+/// `getnetworkinfo`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkInfo {
+    pub version: i64,
+    pub subversion: String,
+    pub protocolversion: i64,
+    pub localservices: Option<String>,
+    pub timeoffset: i64,
+    pub networkactive: Option<bool>,
+    pub connections: Option<i64>,
+    pub networks: Vec<NetworkEntry>,
+    pub relayfee: f64,
+    pub localaddresses: Vec<LocalAddress>,
+    pub warnings: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkEntry {
+    pub name: String,
+    pub limited: bool,
+    pub reachable: bool,
+    pub proxy: String,
+    pub proxy_randomize_credentials: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalAddress {
+    pub address: String,
+    pub port: i64,
+    pub score: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Element of `getpeerinfo`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerInfo {
+    pub id: i64,
+    pub addr: String,
+    pub addrlocal: Option<String>,
+    pub mapped_as: Option<i64>,
+    pub services: String,
+    pub lastsend: i64,
+    pub lastrecv: i64,
+    pub bytessent: i64,
+    pub bytesrecv: i64,
+    pub conntime: i64,
+    pub timeoffset: i64,
+    pub pingtime: f64,
+    pub pingwait: Option<f64>,
+    pub version: i64,
+    pub subver: String,
+    pub inbound: bool,
+    pub addnode: bool,
+    pub masternode: bool,
+    pub startingheight: i64,
+    pub banscore: Option<i64>,
+    pub synced_headers: Option<i64>,
+    pub synced_blocks: Option<i64>,
+    pub inflight: Option<Vec<i64>>,
+    pub addr_processed: Option<i64>,
+    pub addr_rate_limited: Option<i64>,
+    pub whitelisted: bool,
+    pub bytessent_per_msg: HashMap<String, i64>,
+    pub bytesrecv_per_msg: HashMap<String, i64>,
+    pub masternode_iqr_conn: Option<bool>,
+    pub verif_mn_proreg_tx_hash: Option<String>,
+    pub verif_mn_operator_pubkey_hash: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `getmempoolinfo`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolInfo {
+    pub loaded: bool,
+    pub size: i64,
+    pub bytes: i64,
+    pub usage: i64,
+    pub mempoolminfee: f64,
+    pub minrelaytxfee: f64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Verbose `getrawmempool` entry (value of the txid-keyed map).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolEntry {
+    pub size: i64,
+    pub fee: f64,
+    pub modifiedfee: f64,
+    pub time: i64,
+    pub height: i64,
+    pub descendantcount: i64,
+    pub descendantsize: i64,
+    /// Raw satoshis (`GetModFeesWithDescendants`), NOT decimal PIV.
+    pub descendantfees: i64,
+    pub depends: Vec<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `getsupplyinfo` (PIVX-specific).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupplyInfo {
+    pub updateheight: i64,
+    pub transparentsupply: f64,
+    pub shieldsupply: f64,
+    pub totalsupply: f64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `getblockindexstats`. Note the space-keyed field names and that `ttlfee` /
+/// `feeperkb` are money **strings** (`FormatMoney`), not numbers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockIndexStats {
+    #[serde(rename = "Starting block")]
+    pub starting_block: i64,
+    #[serde(rename = "Ending block")]
+    pub ending_block: i64,
+    pub txcount: i64,
+    pub txcount_all: i64,
+    pub txbytes: i64,
+    pub ttlfee: String,
+    pub feeperkb: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `getmininginfo`. In normal mode the node emits both `errors` and
+/// `warnings` (with `-deprecatedrpc=getmininginfo` only `errors`), so
+/// `warnings` is optional.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MiningInfo {
+    pub blocks: i64,
+    pub currentblocksize: i64,
+    pub currentblocktx: i64,
+    pub difficulty: f64,
+    pub genproclimit: i64,
+    pub networkhashps: f64,
+    pub pooledtx: i64,
+    pub testnet: bool,
+    pub chain: String,
+    pub errors: String,
+    pub warnings: Option<String>,
+    pub generate: Option<bool>,
+    pub hashespersec: Option<f64>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `estimatesmartfee`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EstimateSmartFee {
+    /// Fee-per-kB estimate in PIV; `-1.0` when the node has no estimate.
+    pub feerate: f64,
+    pub blocks: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Element of `getbudgetinfo`. Field names are the node's exact PascalCase keys.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetProposal {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "URL")]
+    pub url: String,
+    #[serde(rename = "Hash")]
+    pub hash: String,
+    #[serde(rename = "FeeHash")]
+    pub fee_hash: String,
+    #[serde(rename = "BlockStart")]
+    pub block_start: i64,
+    #[serde(rename = "BlockEnd")]
+    pub block_end: i64,
+    #[serde(rename = "TotalPaymentCount")]
+    pub total_payment_count: i64,
+    #[serde(rename = "RemainingPaymentCount")]
+    pub remaining_payment_count: i64,
+    #[serde(rename = "PaymentAddress")]
+    pub payment_address: String,
+    #[serde(rename = "Ratio")]
+    pub ratio: f64,
+    #[serde(rename = "Yeas")]
+    pub yeas: i64,
+    #[serde(rename = "Nays")]
+    pub nays: i64,
+    #[serde(rename = "Abstains")]
+    pub abstains: i64,
+    #[serde(rename = "TotalPayment")]
+    pub total_payment: f64,
+    #[serde(rename = "MonthlyPayment")]
+    pub monthly_payment: f64,
+    #[serde(rename = "IsEstablished")]
+    pub is_established: bool,
+    #[serde(rename = "IsValid")]
+    pub is_valid: bool,
+    #[serde(rename = "IsInvalidReason")]
+    pub is_invalid_reason: Option<String>,
+    #[serde(rename = "Allotted")]
+    pub allotted: f64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Element of `getbudgetprojection`: a [`BudgetProposal`] plus the running
+/// `TotalBudgetAllotted`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetProjection {
+    #[serde(flatten)]
+    pub proposal: BudgetProposal,
+    #[serde(rename = "TotalBudgetAllotted")]
+    pub total_budget_allotted: f64,
+}
+
+/// `getstakingstatus` (PIVX wallet). `lastattempt_*` are present only after a
+/// staking attempt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StakingStatus {
+    pub staking_status: bool,
+    pub staking_enabled: bool,
+    pub coldstaking_enabled: bool,
+    pub haveconnections: bool,
+    pub mnsync: bool,
+    pub walletunlocked: bool,
+    pub stakeablecoins: i64,
+    pub stakingbalance: f64,
+    pub stakesplitthreshold: f64,
+    pub lastattempt_age: Option<i64>,
+    pub lastattempt_depth: Option<i64>,
+    pub lastattempt_hash: Option<String>,
+    pub lastattempt_coins: Option<i64>,
+    pub lastattempt_tries: Option<i64>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Element of `liststakingaddresses`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StakingAddress {
+    pub label: String,
+    pub address: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }

@@ -17,12 +17,17 @@ languages.
 - Configurable request timeout; response-size cap (default 64 MiB;
   `with_max_response_size` in Rust, `maxResponseBytes` in JS) to protect
   against a hostile node returning an oversized body.
+- Rust: `PivxClient` is cheaply `Clone` — every clone shares the same
+  connection pool and credential store, so a `.cookie` refresh triggered by a
+  401 on one clone is immediately visible to all. Share one client across
+  tasks by cloning rather than rebuilding it.
 - Errors separate the node's own JSON-RPC error (with its numeric code)
   from transport failures, so callers can retry connection errors without
   retrying rejected requests. A failed HTTP 401/403 is its own matchable
   error (JS `AuthError`; Rust `Error::Auth { status }`), distinct from an
   oversized body (Rust `Error::ResponseTooLarge`) and other non-2xx HTTP
-  responses without a JSON-RPC error body (Rust `Error::Http`).
+  responses without a JSON-RPC error body (Rust `Error::Http`). Rust's
+  `Error` is `#[non_exhaustive]`, so match it with a trailing `_ =>` arm.
 - Generic `call(method, params)` escape hatch for any RPC not wrapped below.
 - Batch JSON-RPC: many calls in a single HTTP round-trip, with results
   returned in request order and a single call's error reported in place
@@ -67,6 +72,18 @@ languages.
     `estimateSmartFee`, `getMiningInfo`, `verifyMessage`, `getSupplyInfo`,
     `getBlockIndexStats`. Note: `getmininginfo` requires a daemon compiled
     with `--enable-mining-rpc`, which is off in standard release builds.
+  - Now typed (previously raw JSON): the network, mempool, mining, util,
+    budget, and staking groups — `getNetworkInfo`, `getPeerInfo`,
+    `getMempoolInfo`, `getRawMempool` (overloaded: `string[]` non-verbose, a
+    typed entry map keyed by txid when verbose), `getSupplyInfo`,
+    `getBlockIndexStats`, `getMiningInfo`, `estimateSmartFee`, `getBudgetInfo`,
+    `getBudgetProjection`, `getStakingStatus`, and `listStakingAddresses`.
+    Each typed result carries a forward-compat catch-all (Rust
+    `#[serde(flatten)]` `extra`; JS index signature), so a field a node adds
+    but the SDK doesn't model is preserved rather than dropped.
+    `getMasternodeStatus`, `masternodeCurrent`, and `listMasternodes` stay raw
+    JSON on purpose — their shape is polymorphic (deterministic vs legacy, and
+    a bare string on edge cases).
 - Method names are camelCase in JS, snake_case in Rust
   (`getMasternodeCount` / `get_masternode_count`). Typed methods cover the
   common surface; the generic `call` still reaches any of the node's 224 RPCs.

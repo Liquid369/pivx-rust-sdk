@@ -61,6 +61,10 @@ pivxd rewrites the cookie on every restart. With `Auth::CookieFile`, an HTTP
 credentials changed, so a node restart doesn't require rebuilding the client.
 A 403 (an IP/ACL denial a cookie can't fix) is not retried.
 
+`PivxClient` is cheaply `Clone` — clones share the same connection pool and
+credential store — so hand a clone to each task rather than rebuilding the
+client, and a cookie refresh on any one clone is visible to all.
+
 For multiwallet nodes append `/wallet/<name>` to the URL. There is no TLS:
 run the node on localhost or tunnel the connection; do not expose the RPC
 port.
@@ -112,9 +116,32 @@ structured results (`Transaction`, `ValidateAddress`) rather than a raw
 `serde_json::Value`.
 
 Typed methods now reach the masternode, deterministic-masternode (`protx`),
-budget, staking, and network/mempool/mining/util surface as well. Anything
-still not wrapped goes through `call`, with positional params exactly as
-`pivx-cli` would take them:
+budget, staking, and network/mempool/mining/util surface as well:
+
+```rust
+let fee = client.estimate_smart_fee(6).await?;
+println!("{}", fee.feerate);                  // PIV/kB; -1.0 when the node has no estimate
+
+let staking = client.get_staking_status().await?;
+if staking.staking_status {
+    println!("actively staking");
+}
+
+// non-verbose returns txids; verbose returns a txid → entry map:
+let txids = client.get_raw_mempool().await?;              // Vec<String>
+let entries = client.get_raw_mempool_verbose().await?;    // HashMap<String, MempoolEntry>
+for (txid, e) in &entries {
+    println!("{txid} {}", e.fee);
+}
+```
+
+Each typed status struct keeps a flattened `extra` map, so a field a newer
+node adds is preserved rather than dropped. `get_masternode_status`,
+`masternode_current`, and `list_masternodes` stay a raw `serde_json::Value`
+on purpose — their shape is polymorphic.
+
+Anything still not wrapped goes through `call`, with positional params exactly
+as `pivx-cli` would take them:
 
 ```rust
 let decoded: serde_json::Value =
@@ -126,7 +153,9 @@ own code; transport failures are `Error::Transport`, so retry logic can
 tell them apart. An HTTP 401/403 that survives the cookie refresh is
 `Error::Auth { status }` — a distinct variant, so a credentials problem is
 matchable rather than retried (an oversized body is `Error::ResponseTooLarge`
-and other non-2xx responses without a JSON-RPC error body are `Error::Http`):
+and other non-2xx responses without a JSON-RPC error body are `Error::Http`).
+`Error` is `#[non_exhaustive]`, so a `match` on it needs a trailing catch-all
+arm (`other =>` below):
 
 ```rust
 match client.shield_send_many(FromAddress::AnyShield, &recipients).await {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -242,5 +243,272 @@ async fn oversized_response_is_capped_while_streaming() {
     assert!(
         matches!(err, Error::ResponseTooLarge { limit: 1024, .. }),
         "expected ResponseTooLarge, got {err:?}"
+    );
+}
+
+// ── Typed return shapes ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn parses_block_header() {
+    // previousblockhash present, nextblockhash absent (Option → None).
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"hash":"0abc","confirmations":10,"height":100,"version":8,
+            "merkleroot":"mr","time":1600000000,"mediantime":1599999000,"nonce":42,
+            "bits":"1d00ffff","difficulty":1.5,"chainwork":"00ff","acc_checkpoint":"aa",
+            "shield_pool_value":{"chainValue":12.5,"valueDelta":0.5},
+            "previousblockhash":"prev","chainlock":true},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let h = client.get_block_header("0abc").await.unwrap();
+    assert_eq!(h.height, 100);
+    assert_eq!(h.bits, "1d00ffff");
+    assert_eq!(h.shield_pool_value.chain_value, 12.5);
+    assert_eq!(h.previousblockhash.as_deref(), Some("prev"));
+    assert_eq!(h.nextblockhash, None);
+    assert!(h.chainlock);
+}
+
+#[tokio::test]
+async fn get_tx_out_object_then_null() {
+    // First call → object (reqSigs + addresses present); second → null → None.
+    let (url, _handle) = stub_node(vec![
+        http(
+            "200 OK",
+            r#"{"result":{"bestblock":"bb","confirmations":3,"value":1.23,
+                "scriptPubKey":{"asm":"OP_DUP","hex":"76a9","reqSigs":1,
+                    "type":"pubkeyhash","addresses":["D123"]},
+                "coinbase":false},"error":null,"id":0}"#,
+        ),
+        http("200 OK", r#"{"result":null,"error":null,"id":1}"#),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+
+    let out = client.get_tx_out("t", 0, None).await.unwrap().unwrap();
+    assert_eq!(out.value, 1.23);
+    assert_eq!(out.script_pub_key.req_sigs, Some(1));
+    assert_eq!(
+        out.script_pub_key.addresses.as_deref(),
+        Some(&["D123".to_string()][..])
+    );
+    assert!(!out.coinbase);
+
+    let spent = client.get_tx_out("t", 1, None).await.unwrap();
+    assert!(spent.is_none());
+}
+
+#[tokio::test]
+async fn parses_decoded_transaction_verbose() {
+    // chainlock present (Option Some); blockhash + vout reqSigs absent (None).
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"txid":"t1","version":1,"type":0,"size":200,"locktime":0,
+            "vin":[{"txid":"p1","vout":0,"scriptSig":{"asm":"a","hex":"b"},
+                "sequence":4294967295}],
+            "vout":[{"value":9.99,"n":0,
+                "scriptPubKey":{"asm":"OP","hex":"76","type":"pubkeyhash"}}],
+            "hex":"deadbeef","chainlock":false},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let tx = client
+        .get_raw_transaction_verbose("t1", None)
+        .await
+        .unwrap();
+    assert_eq!(tx.txid, "t1");
+    assert_eq!(tx.tx_type, 0);
+    assert_eq!(tx.vin[0].txid.as_deref(), Some("p1"));
+    assert!(tx.vin[0].script_sig.is_some());
+    assert_eq!(tx.vout[0].value, 9.99);
+    assert_eq!(tx.vout[0].script_pub_key.req_sigs, None);
+    assert_eq!(tx.chainlock, Some(false));
+    assert_eq!(tx.blockhash, None);
+}
+
+#[tokio::test]
+async fn validate_address_valid_then_invalid() {
+    let (url, _handle) = stub_node(vec![
+        http(
+            "200 OK",
+            r#"{"result":{"isvalid":true,"address":"D123","scriptPubKey":"76a9",
+                "ismine":true,"isstaking":false,"iswatchonly":false,"isscript":false},
+                "error":null,"id":0}"#,
+        ),
+        http(
+            "200 OK",
+            r#"{"result":{"isvalid":false},"error":null,"id":1}"#,
+        ),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+
+    let v = client.validate_address("D123").await.unwrap();
+    assert!(v.isvalid);
+    assert_eq!(v.address.as_deref(), Some("D123"));
+    assert_eq!(v.ismine, Some(true));
+
+    let bad = client.validate_address("nope").await.unwrap();
+    assert!(!bad.isvalid);
+    assert_eq!(bad.address, None);
+}
+
+#[tokio::test]
+async fn parses_list_transactions_long_form() {
+    // involvesWatchonly absent (None); fee present; unmodeled `to` mapValue key
+    // flows into `extra`.
+    let (url, handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":[{"category":"send","amount":-1.5,"vout":0,"fee":-0.0001,
+            "confirmations":5,"txid":"tx1","time":1600000000,"timereceived":1600000001,
+            "blockhash":"bh","blockindex":2,"blocktime":1600000002,"to":"memo",
+            "walletconflicts":[]}],"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    // The all-default call must send the node's concrete defaults, NOT nulls,
+    // which the node's unguarded getters would reject.
+    let txs = client
+        .list_transactions(None, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(txs.len(), 1);
+    assert_eq!(txs[0].category, "send");
+    assert_eq!(txs[0].involves_watchonly, None);
+    assert_eq!(txs[0].fee, Some(-0.0001));
+    assert_eq!(
+        txs[0].extra.get("to").and_then(|v| v.as_str()),
+        Some("memo")
+    );
+
+    let request = handle.join().unwrap().remove(0);
+    assert!(
+        request.contains(r#""params":["*",10,0,false,true,true]"#),
+        "list_transactions default must send concrete defaults: {request}"
+    );
+}
+
+#[tokio::test]
+async fn parses_list_since_block() {
+    let (url, handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"transactions":[{"category":"receive","amount":2.0,"vout":1,
+            "confirmations":1,"txid":"tx2","time":1,"timereceived":2,
+            "blockhash":"b","blockindex":0,"blocktime":3,"walletconflicts":[]}],
+            "lastblock":"lb"},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    // No blockhash → the node rejects a null params[0], so we must send NO
+    // params (lists all wallet txs).
+    let r = client.list_since_block(None, None, None).await.unwrap();
+    assert_eq!(r.lastblock, "lb");
+    assert_eq!(r.transactions.len(), 1);
+    assert_eq!(r.transactions[0].category, "receive");
+    assert_eq!(r.transactions[0].fee, None);
+
+    let request = handle.join().unwrap().remove(0);
+    assert!(
+        request.contains(r#""params":[]"#),
+        "list_since_block(None) must send no params: {request}"
+    );
+}
+
+#[tokio::test]
+async fn send_many_wire_params_use_defaults_not_null() {
+    let (url, handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":"txid123","error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let mut amounts = HashMap::new();
+    amounts.insert("Daddr".to_string(), 1.0);
+    // min_conf None + a later Some(subtract): min_conf must become 1, not null.
+    let subtract = vec!["Daddr".to_string()];
+    let txid = client
+        .send_many(&amounts, None, None, Some(true), Some(&subtract))
+        .await
+        .unwrap();
+    assert_eq!(txid, "txid123");
+    let request = handle.join().unwrap().remove(0);
+    // dummy "", amounts, minconf 1 (not null), comment null (node-tolerated),
+    // include_delegated true, subtract array.
+    assert!(
+        request.contains(r#",1,null,true,["Daddr"]]"#),
+        "send_many must send minconf=1 not null: {request}"
+    );
+}
+
+#[tokio::test]
+async fn parses_get_transaction() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"amount":-1.5,"fee":-0.0001,"confirmations":5,"txid":"tx1",
+            "time":1600000000,"timereceived":1600000001,"blockhash":"bh",
+            "blockindex":2,"blocktime":1600000002,"walletconflicts":[],
+            "details":[{"category":"send","amount":-1.5,"vout":0,"fee":-0.0001}],
+            "hex":"aa"},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let tx = client.get_transaction("tx1").await.unwrap();
+    assert_eq!(tx.amount, -1.5);
+    assert_eq!(tx.fee, Some(-0.0001));
+    assert_eq!(tx.details.len(), 1);
+    assert_eq!(tx.details[0].category, "send");
+    assert_eq!(tx.hex, "aa");
+}
+
+#[tokio::test]
+async fn abandon_transaction_null_is_ok() {
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":null,"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    client.abandon_transaction("tx1").await.unwrap();
+}
+
+// ── Batch JSON-RPC ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn call_batch_maps_results_in_order() {
+    // A JSON array: first call succeeds, second returns a node error.
+    let (url, handle) = stub_node(vec![http(
+        "200 OK",
+        r#"[{"result":42,"error":null,"id":0},
+            {"result":null,"error":{"code":-5,"message":"nope"},"id":1}]"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let results = client
+        .call_batch(&[
+            ("getblockcount", vec![]),
+            ("getrawtransaction", vec![serde_json::json!("bad")]),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].as_ref().unwrap().as_i64(), Some(42));
+    match results[1].as_ref().unwrap_err() {
+        Error::Rpc { code, method, .. } => {
+            assert_eq!(*code, -5);
+            assert_eq!(method, "getrawtransaction");
+        }
+        other => panic!("expected Rpc error, got {other:?}"),
+    }
+
+    // Payload is a top-level JSON array of two request objects.
+    let request = handle.join().unwrap().remove(0);
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(
+        body.trim_start().starts_with('['),
+        "batch body not an array: {body}"
+    );
+    assert!(body.contains(r#""method":"getblockcount""#));
+    assert!(body.contains(r#""method":"getrawtransaction""#));
+}
+
+#[tokio::test]
+async fn call_batch_empty_slice_is_rejected() {
+    let client = PivxClient::new("http://127.0.0.1:1".to_string(), Auth::None).unwrap();
+    let err = client.call_batch(&[]).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Rpc { code: -32600, .. }),
+        "expected invalid-request Rpc error, got {err:?}"
     );
 }

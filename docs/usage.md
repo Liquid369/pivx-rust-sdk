@@ -75,13 +75,50 @@ let fee = client.estimate_smart_fee(6).await?;                   // smart fee es
 let addr = client.get_new_shield_address(None).await?;
 ```
 
+v0.4 widened the typed surface across blockchain introspection, raw
+transactions, and exchange-grade wallet calls:
+
+```rust
+let best = client.get_best_block_hash().await?;
+let header = client.get_block_header(&best).await?;
+let utxo = client.get_tx_out(&txid, 0, None).await?;   // None once the output is spent
+
+// Verbose getrawtransaction decodes ANY txid — not just wallet ones — and
+// carries confirmations. Needs -txindex, or pass Some(blockhash) to look in one block:
+let tx = client.get_raw_transaction_verbose(&txid, None).await?;
+println!("{:?}", tx.confirmations);
+
+// Reorg-safe deposit cursor for exchanges: page new wallet txs from the last
+// block you processed; the returned lastblock is your next cursor.
+let since = client.list_since_block(Some(&last_processed), None, None).await?;
+
+// Batch payout to many recipients in one transaction.
+let mut amounts = std::collections::HashMap::new();
+amounts.insert("D1...".to_string(), 1.5);
+amounts.insert("D2...".to_string(), 2.0);
+let payout_txid = client.send_many(&amounts, None, None, None, None).await?;
+
+// Build → sign → broadcast a raw transaction (the node's RPC is
+// signrawtransaction, 4 params; extra args are None here).
+let raw_hex = client.create_raw_transaction(&inputs, &outputs, None).await?;
+let signed = client.sign_raw_transaction(&raw_hex, None, None, None).await?;
+if signed.complete {
+    client.send_raw_transaction(&signed.hex).await?;
+}
+```
+
+`gettransaction` and `validateaddress` are typed too, now returning
+structured results (`Transaction`, `ValidateAddress`) rather than a raw
+`serde_json::Value`.
+
 Typed methods now reach the masternode, deterministic-masternode (`protx`),
 budget, staking, and network/mempool/mining/util surface as well. Anything
 still not wrapped goes through `call`, with positional params exactly as
 `pivx-cli` would take them:
 
 ```rust
-let tips: serde_json::Value = client.call("getchaintips", vec![]).await?;
+let decoded: serde_json::Value =
+    client.call("decodescript", vec![serde_json::json!(script_hex)]).await?;
 ```
 
 Node errors surface as `Error::Rpc { code, message, .. }` with the node's
@@ -95,6 +132,30 @@ and other non-2xx responses without a JSON-RPC error body are `Error::Http`):
 match client.shield_send_many(FromAddress::AnyShield, &recipients).await {
     Err(Error::Rpc { code: -13, .. }) => { /* wallet locked */ }
     other => { /* ... */ }
+}
+```
+
+### Batch calls
+
+`call_batch` sends several calls in one HTTP round-trip. It returns one entry
+per call in request order: `Ok(value)` on success, `Err(Error::Rpc { .. })`
+for a per-call node error that does not fail the batch — only a
+transport/auth failure returns an outer `Err`. Handy for fanning out a set of
+lookups, e.g. several block hashes or txids at once:
+
+```rust
+use serde_json::json;
+
+let results = client.call_batch(&[
+    ("getblockhash", vec![json!(100)]),
+    ("getblockhash", vec![json!(200)]),
+    ("gettxout", vec![json!(txid), json!(0)]),
+]).await?;
+for r in results {
+    match r {
+        Ok(value) => println!("{value}"),
+        Err(e) => eprintln!("{e}"),
+    }
 }
 ```
 

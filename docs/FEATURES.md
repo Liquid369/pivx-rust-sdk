@@ -24,12 +24,33 @@ languages.
   oversized body (Rust `Error::ResponseTooLarge`) and other non-2xx HTTP
   responses without a JSON-RPC error body (Rust `Error::Http`).
 - Generic `call(method, params)` escape hatch for any RPC not wrapped below.
+- Batch JSON-RPC: many calls in a single HTTP round-trip, with results
+  returned in request order and a single call's error reported in place
+  rather than failing the batch — the one thing the generic `call` can't
+  express. JS `client.batch([{ method, params }, ...])` returns an array of
+  `{ result }` | `{ error: { code, message } }`; Rust
+  `client.call_batch(&[(method, params), ...])` returns a `Vec` of
+  `Result<Value, Error>`. Only a transport/auth failure rejects the whole
+  request.
 - Typed methods:
-  - Blockchain: `getBlockCount`, `getBestBlockHash`, `getBlockHash`,
-    `getBlock` (verbosity 0/1/2), `getBlockchainInfo`, `getRawTransaction`,
-    `sendRawTransaction`.
+  - Blockchain and raw transactions: `getBlockCount`, `getBestBlockHash`,
+    `getBlockHash`, `getBlock` (verbosity 0/1/2), `getBlockchainInfo`,
+    `getBlockHeader`, `getChainTips`, `getTxOut` (the unspent output at a
+    given vout, or null/None once it is spent or unknown), `getRawTransaction`
+    (hex, or verbose for a decoded object with `confirmations` — this finally
+    lets you fetch a non-wallet txid, given `-txindex` or a blockhash to look
+    it up in one block), `createRawTransaction`, `decodeRawTransaction`,
+    `signRawTransaction` (the node's RPC is `signrawtransaction`, four
+    params), `sendRawTransaction`.
   - Transparent wallet: `getBalance`, `getNewAddress`, `listUnspent`,
-    `sendToAddress`, `getTransaction`, `getWalletInfo`, `validateAddress`.
+    `sendToAddress`, `getTransaction` (now a structured result type),
+    `validateAddress` (now a structured result type), `listSinceBlock` (the
+    reorg-safe deposit cursor — page wallet txs from the last block you
+    processed and use the returned `lastblock` as the next cursor; the
+    block-anchored way for exchanges to track deposits across reorgs),
+    `listTransactions`, `sendMany` (batch payout to many address→amount
+    recipients in one transaction), `getNewExchangeAddress`,
+    `abandonTransaction`, `getWalletInfo`.
   - Shield: `getNewShieldAddress`, `listShieldAddresses`, `getShieldBalance`,
     `listShieldUnspent`, `listReceivedByShieldAddress`, `shieldSendMany`,
     `rawShieldSendMany`, `viewShieldTransaction`, `getSaplingNotesCount`.

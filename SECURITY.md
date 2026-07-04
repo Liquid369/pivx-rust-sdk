@@ -76,11 +76,30 @@ PoS/header validation, a node that lies self-consistently is believed.
   input fee is never retained or spent, so an attacker cannot freeze
   withdrawals or bloat wallet state by flooding a deposit address with dust.
   Such notes are economically unspendable and are excluded from the balance.
-- **Pending spends are persisted.** Notes committed to a broadcast-but-
-  unconfirmed transaction survive `save()`/`load()`, so a crash between
-  broadcast and finalize cannot resurrect them into a double-spend. After a
-  crash, wait for the in-flight txid to confirm or clearly disappear, sync,
-  then resume — do not force a second send of the same notes.
+- **Pending spends are only as durable as your last save.** Notes and
+  transparent UTXOs committed to a broadcast-but-unconfirmed transaction are
+  held pending and survive `save()`/`load()`, so restarting cannot resurrect a
+  spent input into a double-spend — *provided the restored state was saved
+  after the spend was built and broadcast*. The wallet is a library: `save()`
+  returns state on demand and the caller owns when it is persisted, so a crash
+  between a successful broadcast and persisting the post-send state falls back
+  to older state that does not know the input is spent, and a retry
+  double-spends it. Persist wallet state after building and again after
+  broadcasting — ideally as one atomic reserve → build → save → broadcast →
+  reconcile step against your own storage and locking. On a transport or
+  timeout error the SDK deliberately keeps the spend pending (it discards only
+  on a definitive node rejection), so retry logic must not resurrect it: wait
+  for the in-flight txid to confirm or clearly disappear, sync, then resume —
+  do not force a second send of the same input.
+- **Caller-supplied UTXOs are trusted as mature and spendable.** `addUtxo`
+  (JS) / `add_utxo` (Rust) registers a transparent UTXO as a normal spendable
+  output: it checks only that the script pays one of this wallet's keys (the
+  P2PKH or exchange-script hash), and does not verify confirmations,
+  coinbase/coinstake maturity, or anything more about the source. If you feed
+  UTXOs from your own indexer, enforce confirmation depth and coinbase/
+  coinstake maturity yourself before adding them. UTXOs discovered by the SDK's
+  own block scan (`scanBlock`/`scan_block`, `sync`) are maturity-tracked and
+  are the safer path.
 - **One writer per wallet.** Do not run two syncs, or a sync and a spend,
   concurrently on one wallet instance. (Rust enforces this via `&mut`; JS
   guards it at runtime.)
@@ -92,6 +111,12 @@ If sync reports a sapling-root divergence (`ScanDivergedError` in JS,
 node lied, or saved state is corrupt — call `reloadFromCheckpoint(height)`
 (JS) / `reload_from_checkpoint(height)` (Rust) and re-sync. This resets scan
 state to a checkpoint and rescans; it needs no keys.
+
+On each sync the transparent wallet revalidates its last-scanned block hash and
+self-heals on a same-height tip reorg by re-scanning a window, whereas the
+shield wallet raises the divergence above for you to recover from — but require
+confirmations before crediting either way, since a same-block reorg at the tip
+is only caught on the next sync.
 
 ## Cryptography provenance
 

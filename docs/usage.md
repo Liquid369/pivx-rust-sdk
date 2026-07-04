@@ -392,11 +392,18 @@ ideally on fewer hosts.
 
 Save after every sync and after every send. Pending spends are persisted:
 notes committed to a broadcast-but-unconfirmed transaction survive
-`save()`/`load()`, so a crash between broadcast and finalize cannot
-resurrect them into a double-spend — provided the state you restore was
-saved after the send. After a crash, wait for the in-flight txid to
-confirm or clearly disappear, sync, then resume sending. The spending key
-is never persisted, as above.
+`save()`/`load()`, so a crash cannot resurrect them into a double-spend —
+provided the state you restore was saved after the send. This crate is a
+library: `save()` returns state on demand and you own when it is persisted,
+so there is a crash window between a successful broadcast and your writing
+the post-send state — die there and a restart resumes from older state that
+does not know the notes are spent. Persist after building and again after
+broadcasting, ideally as one atomic reserve → build → save → broadcast →
+reconcile step against your own storage and locking. After a crash, wait for
+the in-flight txid to confirm or clearly disappear, sync, then resume
+sending; on a transport or timeout error the SDK keeps the spend pending (it
+discards only on a definitive node rejection), so your retry logic must not
+resurrect it. The spending key is never persisted, as above.
 
 The state format is versioned JSON, identical across the JS and Rust SDKs.
 
@@ -529,6 +536,13 @@ wallet.balance();                                // sats (u64) — excludes outp
 wallet.utxos().collect::<Vec<_>>();              // all tracked outputs, reserved ones included
 ```
 
+`add_utxo` trusts what you give it: it credits the UTXO as a normal, mature,
+spendable output once the script pays one of this wallet's keys, and does not
+check confirmations or coinbase/coinstake maturity. Feeding UTXOs from your own
+indexer means enforcing confirmation depth and coinbase/coinstake maturity
+yourself; UTXOs found by `scan_block`/`sync` are maturity-tracked (coinbase and
+coinstake outputs stay unspendable until deep enough) and are the safer path.
+
 `scan_block` checks parent-hash continuity: when a block claims to extend
 the last scanned one (height exactly one higher) but its
 `previousblockhash` differs from the hash recorded, it returns
@@ -593,9 +607,13 @@ let json = wallet.save();
 let mut restored = TransparentWallet::load(&seed, &json)?;
 ```
 
-Reservations survive save/load, so a crash between broadcast and
-`mark_spent` cannot resurrect the inputs into a double-spend — provided the
-state was saved after the send. Save after every sync and every send.
+Reservations survive save/load, so a crash cannot resurrect the inputs into
+a double-spend — provided the state was saved after the send. As with the
+shield wallet, `save()` produces state on demand and you own when it lands:
+persist after `build_send` and again after broadcast (an atomic reserve →
+build → save → broadcast → reconcile flow), or a crash in the window between
+broadcast and your save restarts from state that still thinks the inputs are
+spendable. Save after every sync and every send.
 
 ### Exchange addresses
 

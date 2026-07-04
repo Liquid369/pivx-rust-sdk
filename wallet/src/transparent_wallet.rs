@@ -16,6 +16,12 @@ use crate::error::WalletError;
 use crate::transparent::{decode_address, derive_key, hash160, AddressKind};
 use crate::transparent_tx::{build_transparent_tx, script_pubkey_for_address, TxInput, TxOutput};
 
+/// Blocks a detected stale-tip reorg resets below the last-scanned height
+/// before re-scanning. Any reorg at/below our tip changes that block's hash;
+/// resetting a fixed window and re-scanning lets the UTXO model self-heal.
+/// Identical to the JS SDK's `REORG_WINDOW` for cross-SDK parity.
+const REORG_WINDOW: i64 = 100;
+
 /// A tracked unspent transparent output we can spend.
 #[derive(Clone)]
 pub struct OwnedUtxo {
@@ -81,8 +87,18 @@ struct TransparentState {
     last_scanned: i64,
     #[serde(rename = "lastScannedHash")]
     last_scanned_hash: Option<String>,
+    #[serde(rename = "scannedHashes", default)]
+    scanned_hashes: Vec<ScannedHash>,
     utxos: Vec<StateUtxo>,
     pending: Vec<StateOutpoint>,
+}
+
+/// One `(height, hash)` in the rolling reorg window. Field order (height then
+/// hash) is the JSON emission order — must match the JS SDK for byte parity.
+#[derive(Serialize, Deserialize)]
+struct ScannedHash {
+    height: i64,
+    hash: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,6 +138,9 @@ pub struct TransparentWallet {
     last_scanned: i64,
     /// Hash of that block, for reorg detection on the next scan.
     last_scanned_hash: Option<String>,
+    /// Rolling window of the most recent `(height, hash)` pairs (at most
+    /// REORG_WINDOW), walked back on a tip mismatch to locate the true fork.
+    scanned_hashes: Vec<(i64, String)>,
     /// Outpoints reserved by an unfinalized [`build_send`](Self::build_send):
     /// excluded from selection and balance until `mark_spent` or `release`.
     pending: HashSet<(String, u32)>,
@@ -157,6 +176,7 @@ impl TransparentWallet {
             utxos: HashMap::new(),
             last_scanned: 0,
             last_scanned_hash: None,
+            scanned_hashes: Vec::new(),
             pending: HashSet::new(),
         })
     }
@@ -305,6 +325,18 @@ impl TransparentWallet {
             self.last_scanned = h;
         }
         self.last_scanned_hash = block["hash"].as_str().map(str::to_string);
+        // Record this block in the rolling window (same hash guard as
+        // last_scanned_hash), trimming to the last REORG_WINDOW entries.
+        if let Some(hash) = self.last_scanned_hash.clone() {
+            self.scanned_hashes.push((self.last_scanned, hash));
+            let overflow = self
+                .scanned_hashes
+                .len()
+                .saturating_sub(REORG_WINDOW as usize);
+            if overflow > 0 {
+                self.scanned_hashes.drain(0..overflow);
+            }
+        }
         let height = self.last_scanned;
         let Some(txs) = block["tx"].as_array() else {
             return Ok(());
@@ -360,8 +392,10 @@ impl TransparentWallet {
     /// Recovery after [`scan_block`](Self::scan_block) returns
     /// [`ScanDiverged`](WalletError::ScanDiverged): reset to a height below
     /// the fork point, then re-sync. Drops every scanned UTXO (height > 0)
-    /// above `height` along with its pending reservation, and clears the
-    /// stored block hash. Caller-supplied UTXOs (height 0) are kept.
+    /// above `height` along with its pending reservation, and trims the reorg
+    /// window to `height` — restoring the stored block hash from the retained
+    /// window entry at `height`, or clearing it if none. Caller-supplied UTXOs
+    /// (height 0) are kept.
     pub fn reset_scan(&mut self, height: i64) {
         let dropped: Vec<(String, u32)> = self
             .utxos
@@ -374,7 +408,17 @@ impl TransparentWallet {
             self.pending.remove(k);
         }
         self.last_scanned = height;
-        self.last_scanned_hash = None;
+        // Trim the window to entries at/below the reset height and restore the
+        // stored hash from the retained entry AT `height` (keeps continuity
+        // when resetting to a known fork); a reset to a height not in the
+        // window yields None, preserving prior behavior.
+        self.scanned_hashes.retain(|(h, _)| *h <= height);
+        self.last_scanned_hash = self
+            .scanned_hashes
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == height)
+            .map(|(_, hash)| hash.clone());
     }
 
     /// Total spendable transparent balance in satoshis, excluding outpoints
@@ -558,6 +602,14 @@ impl TransparentWallet {
             })
             .collect();
         pending.sort_unstable_by(|a, b| (a.txid.as_str(), a.vout).cmp(&(b.txid.as_str(), b.vout)));
+        let scanned_hashes: Vec<ScannedHash> = self
+            .scanned_hashes
+            .iter()
+            .map(|(height, hash)| ScannedHash {
+                height: *height,
+                hash: hash.clone(),
+            })
+            .collect();
         serde_json::to_string(&TransparentState {
             version: 1,
             network: match self.network {
@@ -570,6 +622,7 @@ impl TransparentWallet {
             next_change: self.next_change,
             last_scanned: self.last_scanned,
             last_scanned_hash: self.last_scanned_hash.clone(),
+            scanned_hashes,
             utxos,
             pending,
         })
@@ -615,6 +668,20 @@ impl TransparentWallet {
         w.next_change = s.next_change;
         w.last_scanned = s.last_scanned;
         w.last_scanned_hash = s.last_scanned_hash;
+        // Restore the reorg window (absent in older states → empty via serde
+        // default). Reject a negative height, matching the last_scanned guard.
+        for e in &s.scanned_hashes {
+            if e.height < 0 {
+                return Err(WalletError::Other(
+                    "wallet state has a negative scanned-hash height".into(),
+                ));
+            }
+        }
+        w.scanned_hashes = s
+            .scanned_hashes
+            .into_iter()
+            .map(|e| (e.height, e.hash))
+            .collect();
         let is_txid = |t: &str| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit());
         for u in s.utxos {
             // Same bounds as the JS SDK so a state either loads in both or
@@ -690,6 +757,41 @@ impl TransparentWallet {
     ) -> Result<(), WalletError> {
         let tip = client.get_block_count().await?;
         let batch = batch_size.max(1);
+        // Stale-tip reorg self-heal: the forward scan below only re-examines
+        // blocks above last_scanned, so a reorg at/below our tip (which changes
+        // that block's hash without changing the tip height) would go unnoticed
+        // and leave an orphaned deposit credited. Compare the node's current
+        // hash for last_scanned against the stored one; on a mismatch, walk the
+        // recorded hash window back to the true fork and reset there.
+        if self.last_scanned > 0 {
+            if let Some(local) = self.last_scanned_hash.clone() {
+                let node_tip = client.get_block_hash(self.last_scanned).await?;
+                if node_tip != local {
+                    // Reorg: walk the stored window newest→oldest for the
+                    // highest height the node still agrees on (the true fork).
+                    // Found → rewind there and forward-scan. None matches → the
+                    // reorg is deeper than the window; fail safe rather than
+                    // silently retain orphaned UTXOs below a fixed reset floor.
+                    let mut fork = None;
+                    for (h, hash) in self.scanned_hashes.clone().into_iter().rev() {
+                        if client.get_block_hash(h).await? == hash {
+                            fork = Some(h);
+                            break;
+                        }
+                    }
+                    match fork {
+                        Some(f) => self.reset_scan(f),
+                        None => {
+                            return Err(WalletError::ScanDiverged {
+                                height: self.last_scanned,
+                                local,
+                                node: node_tip,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         let mut from = from_height.max(self.last_scanned + 1);
         while from <= tip {
             let to = (from + batch - 1).min(tip);
@@ -943,6 +1045,10 @@ mod tests {
         let (_, spent) = w.build_send(&dest, 100_000_000, Some(100)).unwrap();
         let json = w.save();
         assert!(!json.contains("secret") && !json.contains(&hex::encode(seed)));
+        // The reorg window (block 50) is persisted and round-trips.
+        assert!(json.contains(
+            "\"scannedHashes\":[{\"height\":50,\"hash\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\"}]"
+        ));
 
         let mut r = TransparentWallet::load(&seed, &json).unwrap();
         assert_eq!(r.last_scanned_block(), 50);
@@ -1073,7 +1179,7 @@ mod tests {
     // Cross-SDK state fixture: this exact JSON is what BOTH SDKs' save() must
     // emit for the recipe below (the JS suite byte-compares the same string).
     // Any change to the state format must update both suites together.
-    const CROSS_SDK_STATE: &str = "{\"version\":1,\"network\":\"mainnet\",\"account\":0,\"gap\":3,\"nextExternal\":1,\"nextChange\":1,\"lastScanned\":7,\"lastScannedHash\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"utxos\":[{\"txid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"vout\":0,\"amount\":123456789,\"scriptPubKey\":\"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac\",\"keyHash\":\"9fae9617b8665480001546cf2825fcc6465e0c32\",\"coinbase\":false,\"height\":0},{\"txid\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"vout\":0,\"amount\":100000000,\"scriptPubKey\":\"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac\",\"keyHash\":\"9fae9617b8665480001546cf2825fcc6465e0c32\",\"coinbase\":true,\"height\":7}],\"pending\":[{\"txid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"vout\":0}]}";
+    const CROSS_SDK_STATE: &str = "{\"version\":1,\"network\":\"mainnet\",\"account\":0,\"gap\":3,\"nextExternal\":1,\"nextChange\":1,\"lastScanned\":7,\"lastScannedHash\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"scannedHashes\":[{\"height\":7,\"hash\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\"}],\"utxos\":[{\"txid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"vout\":0,\"amount\":123456789,\"scriptPubKey\":\"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac\",\"keyHash\":\"9fae9617b8665480001546cf2825fcc6465e0c32\",\"coinbase\":false,\"height\":0},{\"txid\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"vout\":0,\"amount\":100000000,\"scriptPubKey\":\"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac\",\"keyHash\":\"9fae9617b8665480001546cf2825fcc6465e0c32\",\"coinbase\":true,\"height\":7}],\"pending\":[{\"txid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"vout\":0}]}";
 
     #[test]
     fn save_is_byte_identical_to_js_sdk_for_shared_recipe() {
@@ -1102,6 +1208,8 @@ mod tests {
         let seed = [1u8; 32];
         let w = TransparentWallet::load(&seed, CROSS_SDK_STATE).unwrap();
         assert_eq!(w.last_scanned_block(), 7);
+        // The reorg window survived the load: re-saving reproduces it exactly.
+        assert_eq!(w.save(), CROSS_SDK_STATE);
         // aa:0 reserved; coinbase counted (maturity gates spend, not balance).
         assert_eq!(w.balance(), 100_000_000);
         assert_eq!(w.utxos().count(), 2);
@@ -1176,5 +1284,206 @@ mod tests {
         let st: serde_json::Value = serde_json::from_str(&w.save()).unwrap();
         assert!(st["pending"].as_array().unwrap().is_empty());
         assert!(st["utxos"].as_array().unwrap().is_empty());
+    }
+
+    /// Minimal loopback JSON-RPC stub: `handler` maps a raw request body to
+    /// the JSON `result` value, served until the client stops. Lets a test
+    /// answer per-height (e.g. getblockhash) instead of one value per method.
+    #[cfg(feature = "rpc")]
+    fn stub_node_fn<F>(handler: F) -> String
+    where
+        F: Fn(&str) -> String + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let result = handler(&req);
+                let body = format!("{{\"result\":{result},\"error\":null,\"id\":0}}");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        url
+    }
+
+    /// Convenience over [`stub_node_fn`]: one canned result per method, matched
+    /// by the request's `"method"` field. Params are ignored, so the same value
+    /// answers every height.
+    #[cfg(feature = "rpc")]
+    fn stub_node(results: std::collections::HashMap<&'static str, String>) -> String {
+        stub_node_fn(move |req| {
+            let method = results
+                .keys()
+                .find(|m| req.contains(&format!("\"method\":\"{m}\"")))
+                .copied()
+                .unwrap_or("");
+            results
+                .get(method)
+                .cloned()
+                .unwrap_or_else(|| "null".into())
+        })
+    }
+
+    /// No reorg: the node's hash for last_scanned matches the stored one, so
+    /// sync must NOT reset — it just scans the one new block forward.
+    #[cfg(feature = "rpc")]
+    #[tokio::test]
+    async fn sync_no_reorg_does_not_reset() {
+        use pivx_rpc::{Auth, PivxClient};
+        let seed = [21u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let s0_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        // Scanned block 1 (hash aa..) credited us 1 PIV.
+        w.scan_block(&serde_json::json!({
+            "height": 1, "hash": "aa".repeat(32),
+            "tx": [{ "txid": "e1".repeat(32), "vin": [{ "txid": "f1".repeat(32), "vout": 0 }],
+                     "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": { "hex": s0_hex } }] }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 100_000_000);
+
+        // Node: getblockhash(1) still returns aa.. (no reorg); tip is now 2 and
+        // block 2 extends aa.. crediting another 0.5 PIV.
+        let mut results = std::collections::HashMap::new();
+        results.insert("getblockcount", "2".to_string());
+        results.insert("getblockhash", format!("\"{}\"", "aa".repeat(32)));
+        results.insert(
+            "getblock",
+            serde_json::json!({
+                "height": 2, "hash": "bb".repeat(32), "previousblockhash": "aa".repeat(32),
+                "tx": [{ "txid": "e2".repeat(32), "vin": [{ "txid": "f2".repeat(32), "vout": 0 }],
+                         "vout": [{ "n": 0, "value": 0.5, "scriptPubKey": { "hex": s0_hex } }] }],
+            })
+            .to_string(),
+        );
+        let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+        w.sync(&client, 0, 10).await.unwrap();
+        // No reset: original UTXO kept AND the new block credited on top.
+        assert_eq!(w.balance(), 150_000_000);
+        assert_eq!(w.utxos().count(), 2);
+        assert_eq!(w.last_scanned_block(), 2);
+    }
+
+    /// Beyond-window reorg: the fork lies below the earliest stored hash
+    /// (here the window holds only height 1, and the node disagrees there),
+    /// so the walk-back finds no common block. sync must fail safe with
+    /// ScanDiverged rather than silently resetting a fixed floor — the S4 bug
+    /// was that a reorg deeper than REORG_WINDOW retained orphaned UTXOs.
+    #[cfg(feature = "rpc")]
+    #[tokio::test]
+    async fn sync_beyond_window_reorg_diverges() {
+        use pivx_rpc::{Auth, PivxClient};
+        let seed = [22u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let s0 = spk(&p2pkh_address(&a0.public_key, MainNetwork));
+        // A caller-supplied UTXO (height 0) plus a scanned orphan (height 1).
+        w.add_utxo("00".repeat(32).as_str(), 0, 50_000_000, s0.clone());
+        w.scan_block(&serde_json::json!({
+            "height": 1, "hash": "aa".repeat(32),
+            "tx": [{ "txid": "e1".repeat(32), "vin": [{ "txid": "f1".repeat(32), "vout": 0 }],
+                     "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": { "hex": hex::encode(&s0) } }] }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 150_000_000);
+        assert_eq!(w.last_scanned_block(), 1);
+
+        // Node: getblockhash returns cc.. at every height (never the stored
+        // aa..), so no window entry matches and the walk-back exhausts.
+        let mut results = std::collections::HashMap::new();
+        results.insert("getblockcount", "1".to_string());
+        results.insert("getblockhash", format!("\"{}\"", "cc".repeat(32)));
+        let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+        let err = w.sync(&client, 0, 10).await.unwrap_err();
+        assert!(matches!(err, WalletError::ScanDiverged { .. }));
+        // Fail-safe: nothing mutated — the orphan is surfaced to the caller,
+        // not silently retained below a blind reset.
+        assert_eq!(w.balance(), 150_000_000);
+        assert_eq!(w.utxos().count(), 2);
+        assert_eq!(w.last_scanned_block(), 1);
+    }
+
+    /// Within-window reorg: the node replaced the tip block (height 3) but
+    /// still agrees at height 2. sync must walk the window back to the TRUE
+    /// fork (2, not a blind lastScanned-100), drop the orphan on the old
+    /// chain, and credit the replacement chain.
+    #[cfg(feature = "rpc")]
+    #[tokio::test]
+    async fn sync_within_window_reorg_resets_to_true_fork() {
+        use pivx_rpc::{Auth, PivxClient};
+        let seed = [23u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let s0 = spk(&p2pkh_address(&a0.public_key, MainNetwork));
+        // Node's canonical hash for a height (matches the stub below).
+        let nh = |h: i64| format!("{h:064x}");
+        // Scan the node's chain 1→3, storing its canonical hashes for 1,2 but
+        // the OLD (orphan) hash for 3, which credited us 1 PIV.
+        w.scan_block(&serde_json::json!({ "height": 1, "hash": nh(1), "tx": [] }))
+            .unwrap();
+        w.scan_block(
+            &serde_json::json!({ "height": 2, "hash": nh(2), "previousblockhash": nh(1), "tx": [] }),
+        )
+        .unwrap();
+        w.scan_block(&serde_json::json!({
+            "height": 3, "hash": "ab".repeat(32), "previousblockhash": nh(2),
+            "tx": [{ "txid": "e3".repeat(32), "vin": [{ "txid": "f3".repeat(32), "vout": 0 }],
+                     "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": { "hex": hex::encode(&s0) } }] }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 100_000_000);
+        assert_eq!(w.last_scanned_block(), 3);
+
+        // Node: getblockhash(h) = the canonical hash for h, so height 3 no
+        // longer matches the stored orphan while height 2 still does. The
+        // replacement block 3 (fetched during forward-scan) pays us 2 PIV.
+        let new_block3 = serde_json::json!({
+            "height": 3, "hash": nh(3), "previousblockhash": nh(2),
+            "tx": [{ "txid": "e9".repeat(32), "vin": [{ "txid": "f9".repeat(32), "vout": 0 }],
+                     "vout": [{ "n": 0, "value": 2.0, "scriptPubKey": { "hex": hex::encode(&s0) } }] }],
+        })
+        .to_string();
+        let url = stub_node_fn(move |req| {
+            if req.contains("\"method\":\"getblockcount\"") {
+                "3".to_string()
+            } else if req.contains("\"method\":\"getblockhash\"") {
+                let h: i64 = req
+                    .split("\"params\":[")
+                    .nth(1)
+                    .and_then(|s| s.split(']').next())
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                format!("\"{h:064x}\"")
+            } else {
+                new_block3.clone()
+            }
+        });
+        let client = PivxClient::new(url, Auth::None).unwrap();
+        w.sync(&client, 0, 10).await.unwrap();
+
+        // Reset to the true fork (2): the orphan (old block 3) is dropped and
+        // the replacement chain's 2 PIV credited; last_scanned back at the tip.
+        assert_eq!(w.last_scanned_block(), 3);
+        assert_eq!(w.balance(), 200_000_000);
+        assert_eq!(w.utxos().count(), 1);
+        assert!(w.utxos().all(|u| u.txid == "e9".repeat(32)));
     }
 }

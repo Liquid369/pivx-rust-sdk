@@ -657,6 +657,30 @@ mod rpc_sync {
             let batch_size = batch_size.max(1);
             let tip = client.get_block_count().await?;
             self.ensure_valid_checkpoint(client).await?;
+            // Stale-tip reorg detection: when the tip height hasn't advanced
+            // past ours the batch loop below never runs, so its per-batch root
+            // check can't notice a same-height reorg that rewrote the shielded
+            // set at our tip. The commitment tree can't be cheaply rewound, so
+            // re-verify the tip's finalsaplingroot against our local root (the
+            // same comparison the batch loop makes) and diverge on mismatch;
+            // the caller recovers via reload_from_checkpoint. Skip a wallet
+            // still sitting on its checkpoint (nothing scanned yet).
+            let (cp_height, _) = get_checkpoint(self.last_processed_block as i32, self.network);
+            if self.last_processed_block == tip && self.last_processed_block > cp_height as i64 {
+                let hash = client.get_block_hash(tip).await?;
+                let block = client.get_block(&hash, 1).await?;
+                let node_root = block["finalsaplingroot"].as_str().ok_or_else(|| {
+                    WalletError::Other(format!("node omitted finalsaplingroot at height {tip}"))
+                })?;
+                let local = self.sapling_root()?;
+                if local != node_root {
+                    return Err(WalletError::ScanDiverged {
+                        height: tip,
+                        local,
+                        node: node_root.to_string(),
+                    });
+                }
+            }
             while self.last_processed_block < tip {
                 let from = self.last_processed_block + 1;
                 let to = (from + batch_size - 1).min(tip);

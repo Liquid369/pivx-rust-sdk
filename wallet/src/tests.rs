@@ -426,6 +426,59 @@ async fn sync_rejects_missing_sapling_root() {
     );
 }
 
+/// last_processed == tip with a MATCHING tip root: nothing new to scan and the
+/// node's finalsaplingroot agrees with our tree, so the same-height reorg
+/// guard is a clean no-op.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_match_is_noop() {
+    use pivx_rpc::{Auth, PivxClient};
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.prime_for_sync_test(BIRTH);
+    let local_root = wallet.sapling_root().unwrap();
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{BIRTH}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{local_root}\"}}"),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    wallet.sync(&client, 10).await.unwrap();
+    assert_eq!(wallet.last_synced_block(), BIRTH);
+}
+
+/// last_processed == tip but the node's tip finalsaplingroot DIFFERS (a
+/// same-height reorg changed the shielded set): the batch loop never runs, so
+/// this tip-root check is the only thing that catches it. sync must diverge;
+/// recovery via reload_from_checkpoint still works.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_mismatch_diverges() {
+    use pivx_rpc::{Auth, PivxClient};
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.prime_for_sync_test(BIRTH);
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{BIRTH}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // A root that cannot equal the wallet's local tree root.
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{}\"}}", "ff".repeat(32)),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    let err = wallet.sync(&client, 10).await.unwrap_err();
+    assert!(
+        matches!(err, WalletError::ScanDiverged { .. }),
+        "got {err:?}"
+    );
+    // Recovery path still works.
+    wallet.reload_from_checkpoint(BIRTH);
+    assert!(wallet.last_synced_block() <= BIRTH);
+}
+
 /// send() must prove on the blocking pool, not the async runtime. On a
 /// single-threaded runtime a 10ms ticker task runs concurrently with send();
 /// if the 300ms (mock-delayed) proof ran inline on the worker thread the

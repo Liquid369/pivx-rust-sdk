@@ -91,6 +91,23 @@ languages.
   Emits new-note, spent, and balance-change events (JS `EventEmitter`; Rust
   returns events from `poll()` so the caller drives the cadence). Does not
   crash the process when no error handler is attached (JS).
+- ZMQ push notifications: subscribe to pivxd's `-zmqpub*` endpoints (topics
+  `hashblock`, `hashtx`, `rawblock`, `rawtx`) to trigger a wallet sync on each
+  new block or tx instead of polling. Two layers, matching across both SDKs:
+  - A pure, dependency-free decoder — JS `parseZmqFrame`, Rust
+    `parse_zmq_frame` — for the node's 3-part multipart message
+    (`[topic, body, sequence]`). Bring your own socket.
+  - A `ZmqSubscriber` convenience that owns a SUB socket and yields decoded
+    events. Its transport dependency stays out of default builds: in JS,
+    `zeromq` is NOT a runtime dependency (the package stays zero-runtime-deps
+    and browser-importable) — you `npm install zeromq` yourself and it is
+    imported dynamically only when `connect()` runs; in Rust, `ZmqSubscriber`
+    is behind an off-by-default `zmq` cargo feature (the pure-Rust `zeromq`
+    crate, no libzmq), so default builds pull nothing.
+  The decoded event shape is the same in both SDKs: `hashblock`/`hashtx` carry
+  the 32-byte hash as a display-order hex string; `rawblock`/`rawtx` carry the
+  raw serialized bytes (`block` / `tx`); every event carries the topic's
+  little-endian `sequence` counter.
 - Amounts are PIV as the node emits them (decimal `number` / `f64`).
 
 ## pivx-wallet — standalone wallet

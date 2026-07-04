@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-04
+
+### Added
+
+- `pivx-rpc`: ZMQ push notifications. `parse_zmq_frame` is a pure decoder for
+  pivxd's 3-part multipart message (topics `hashblock`, `hashtx`, `rawblock`,
+  `rawtx`) — bring your own socket; always compiled. `ZmqSubscriber`
+  (`connect` + `recv`) is a convenience over the pure-Rust `zeromq` crate,
+  behind an off-by-default `zmq` cargo feature (no system libzmq), so default
+  builds pull nothing. Typed events carry the block/tx hash or raw bytes plus a
+  little-endian sequence. Typical use: trigger a wallet sync on each new block.
+
 ## [0.5.0] - 2026-07-03
 
 ### Added

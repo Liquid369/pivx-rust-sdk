@@ -31,7 +31,11 @@
 mod client;
 mod shield;
 mod types;
+pub mod zmq;
 
 pub use client::{Auth, Error, PivxClient, Result};
 pub use shield::{ShieldEvent, ShieldWatcher, WatchOptions};
 pub use types::*;
+#[cfg(feature = "zmq")]
+pub use zmq::ZmqSubscriber;
+pub use zmq::{parse_zmq_frame, ZmqError, ZmqEvent};

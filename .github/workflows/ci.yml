@@ -16,3 +16,6 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked -- -D warnings
+      # The optional `zmq` feature is off by default; exercise it so it can't rot.
+      - run: cargo test -p pivx-rpc --features zmq --locked
+      - run: cargo clippy -p pivx-rpc --features zmq --all-targets --locked -- -D warnings

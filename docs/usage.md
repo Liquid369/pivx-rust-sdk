@@ -236,6 +236,49 @@ let txid = client.shield_send_many(
 let view = client.view_shield_transaction(&txid).await?;  // decrypted amounts + memos
 ```
 
+### ZMQ push notifications
+
+v0.6 adds ZMQ push notifications: pivxd can push a notification on every new
+block or transaction, so you can trigger a wallet `sync` the moment the chain
+moves instead of polling `ShieldWatcher`. (v0.6.0 ships pivx-rpc 0.5.0.) Launch
+the node with the matching endpoints, e.g.
+`-zmqpubhashblock=tcp://127.0.0.1:28332 -zmqpubrawtx=tcp://127.0.0.1:28332`
+(topics: `hashblock`, `hashtx`, `rawblock`, `rawtx`).
+
+`ZmqSubscriber` is behind the off-by-default `zmq` cargo feature (a pure-Rust
+`zeromq` crate, no libzmq), so enable it to pull the socket in:
+
+```toml
+pivx-rpc = { git = "https://github.com/Liquid369/pivx-rust-sdk", features = ["zmq"] }
+```
+
+It owns a SUB socket; drive the cadence by awaiting `recv`:
+
+```rust
+use pivx_rpc::{ZmqEvent, ZmqSubscriber};
+
+let mut sub = ZmqSubscriber::connect("tcp://127.0.0.1:28332", &["hashblock"]).await?;
+loop {
+    match sub.recv().await? {
+        ZmqEvent::HashBlock { hash, .. } => {
+            println!("new block {hash}");
+            wallet.sync(&client, 100).await?;
+        }
+        _ => {}
+    }
+}
+```
+
+`connect` blocks on the underlying ~30s connect timeout against a dead endpoint
+before returning `Err` rather than failing fast; wrap it in
+`tokio::time::timeout` if you need quicker failover. `HashBlock`/`HashTx` carry
+`hash` (display-order hex); `RawBlock`/`RawTx` carry raw bytes as `block` / `tx`;
+every variant carries a little-endian `sequence`.
+
+If you already have a socket, skip the subscriber and decode frames yourself
+with the pure `parse_zmq_frame(topic, body, seq)` — always compiled, no feature
+needed — which returns the same typed `ZmqEvent`.
+
 ## pivx-wallet
 
 ### Creating a wallet

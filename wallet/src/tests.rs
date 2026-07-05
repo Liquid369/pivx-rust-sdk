@@ -5,7 +5,7 @@ use crate::test_fixtures::*;
 use crate::transaction::{self, TxOptions};
 use crate::wallet::{SendOptions, ShieldWallet, WalletBlock};
 use crate::{keys, WalletError};
-use pivx_primitives::consensus::Network::TestNetwork;
+use pivx_primitives::consensus::Network::{MainNetwork, TestNetwork};
 
 const BIRTH: i64 = 100;
 
@@ -401,23 +401,22 @@ async fn sync_rejects_wrong_block_height() {
 }
 
 /// A node that omits finalsaplingroot past activation must not let the wallet
-/// advance unverified.
+/// advance unverified. Scan a block above activation, where the per-batch root
+/// check runs (below activation the check is skipped, so this would be a no-op).
 #[cfg(feature = "rpc")]
 #[tokio::test]
 async fn sync_rejects_missing_sapling_root() {
     use pivx_rpc::{Auth, PivxClient};
+    const H: i64 = 43_200; // well above real V5_0 activation (201), so the check runs
     let mut results = std::collections::HashMap::new();
-    results.insert("getblockcount", format!("{}", BIRTH + 1));
+    results.insert("getblockcount", format!("{}", H + 1));
     results.insert("getblockhash", "\"deadbeef\"".to_string());
     // Correct height, empty block, but no finalsaplingroot field.
-    results.insert(
-        "getblock",
-        format!("{{\"height\":{},\"tx\":[]}}", BIRTH + 1),
-    );
+    results.insert("getblock", format!("{{\"height\":{},\"tx\":[]}}", H + 1));
     let url = stub_node(results);
 
     let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
-    wallet.prime_for_sync_test(BIRTH);
+    wallet.prime_for_sync_test(H);
     let client = PivxClient::new(url, Auth::None).unwrap();
     let err = wallet.sync(&client, 10).await.unwrap_err();
     assert!(
@@ -427,18 +426,21 @@ async fn sync_rejects_missing_sapling_root() {
 }
 
 /// last_processed == tip with a MATCHING tip root: nothing new to scan and the
-/// node's finalsaplingroot agrees with our tree, so the same-height reorg
-/// guard is a clean no-op.
+/// node's finalsaplingroot agrees with our tree, so the same-height reorg guard
+/// is a clean no-op. Runs at a height >= 201 (testnet V5_0 activation) so the
+/// stale-tip check actually compares local vs node root — below activation it
+/// would skip and pass without ever comparing.
 #[cfg(feature = "rpc")]
 #[tokio::test]
 async fn sync_tip_root_match_is_noop() {
     use pivx_rpc::{Auth, PivxClient};
+    const H: i64 = 43_200; // above testnet V5_0 activation (201), so the check runs
     let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
-    wallet.prime_for_sync_test(BIRTH);
+    wallet.prime_for_sync_test(H);
     let local_root = wallet.sapling_root().unwrap();
 
     let mut results = std::collections::HashMap::new();
-    results.insert("getblockcount", format!("{BIRTH}"));
+    results.insert("getblockcount", format!("{H}"));
     results.insert("getblockhash", "\"deadbeef\"".to_string());
     results.insert(
         "getblock",
@@ -446,22 +448,25 @@ async fn sync_tip_root_match_is_noop() {
     );
     let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
     wallet.sync(&client, 10).await.unwrap();
-    assert_eq!(wallet.last_synced_block(), BIRTH);
+    assert_eq!(wallet.last_synced_block(), H);
 }
 
 /// last_processed == tip but the node's tip finalsaplingroot DIFFERS (a
 /// same-height reorg changed the shielded set): the batch loop never runs, so
 /// this tip-root check is the only thing that catches it. sync must diverge;
-/// recovery via reload_from_checkpoint still works.
+/// recovery via reload_from_checkpoint still works. At/above activation, where
+/// the stale-tip check runs (below it the node reports a zero root our non-zero
+/// empty tree can't match, so the check is skipped).
 #[cfg(feature = "rpc")]
 #[tokio::test]
 async fn sync_tip_root_mismatch_diverges() {
     use pivx_rpc::{Auth, PivxClient};
+    const H: i64 = 43_200; // well above real V5_0 activation (201), so the check runs
     let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
-    wallet.prime_for_sync_test(BIRTH);
+    wallet.prime_for_sync_test(H);
 
     let mut results = std::collections::HashMap::new();
-    results.insert("getblockcount", format!("{BIRTH}"));
+    results.insert("getblockcount", format!("{H}"));
     results.insert("getblockhash", "\"deadbeef\"".to_string());
     // A root that cannot equal the wallet's local tree root.
     results.insert(
@@ -475,8 +480,155 @@ async fn sync_tip_root_mismatch_diverges() {
         "got {err:?}"
     );
     // Recovery path still works.
-    wallet.reload_from_checkpoint(BIRTH);
-    assert!(wallet.last_synced_block() <= BIRTH);
+    wallet.reload_from_checkpoint(H);
+    assert!(wallet.last_synced_block() <= H);
+}
+
+/// An honest wallet at last_processed == tip == H BELOW real V5_0 activation
+/// (testnet 201): PIVX reports finalsaplingroot = 0 (UINT256_ZERO) there while
+/// our empty tree carries the non-zero sapling empty root. The stale-tip check
+/// must skip below activation, so sync is a clean no-op — not a false divergence.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_below_activation_is_noop() {
+    use pivx_rpc::{Auth, PivxClient};
+    const H: i64 = 100; // below testnet V5_0 activation (201)
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.prime_for_sync_test(H); // empty tree, honest below-activation tip
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{H}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // Pre-activation nodes report an all-zero finalsaplingroot.
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{}\"}}", "00".repeat(32)),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    // Must not throw: the zero root mismatches our non-zero empty-tree root, but
+    // the check is skipped below activation.
+    wallet.sync(&client, 10).await.unwrap();
+    assert_eq!(wallet.last_synced_block(), H);
+}
+
+/// The fail-open gap the old 43_200 constant left: a testnet wallet at a height
+/// in [201, 43_200) is at/above real V5_0 activation (201) but below the old
+/// constant, so the stale-tip check was skipped and a divergence went uncaught.
+/// With testnet activation set to its real 201 the check now runs and catches
+/// it: FAILS before (10_000 < 43_200 → skipped → no divergence), PASSES after
+/// (10_000 >= 201 → ScanDiverged).
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_in_activation_gap_diverges() {
+    use pivx_rpc::{Auth, PivxClient};
+    const H: i64 = 10_000; // in [201, 43_200): above real activation, below old constant
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.prime_for_sync_test(H);
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{H}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // A root that cannot equal the wallet's local tree root.
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{}\"}}", "ff".repeat(32)),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    let err = wallet.sync(&client, 10).await.unwrap_err();
+    assert!(
+        matches!(err, WalletError::ScanDiverged { .. }),
+        "got {err:?}"
+    );
+}
+
+/// MAINNET regression for the corrected V5_0 activation (2_700_500, not
+/// 2_700_000). A wallet resolving to the base checkpoint 2_700_000 with node tip
+/// == 2_700_000 sits BELOW real activation, where PIVX reports finalsaplingroot
+/// = 0. The stale-tip check must skip, so sync is a clean no-op. With the old
+/// 2_700_000 constant the guard ran (2_700_000 >= 2_700_000) and false-diverged:
+/// FAILS before the constant fix, PASSES after.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_below_activation_is_noop_mainnet() {
+    use pivx_rpc::{Auth, PivxClient};
+    const CP: i64 = 2_700_000; // base mainnet checkpoint, below real V5_0 (2_700_500)
+    let mut wallet = ShieldWallet::from_seed(&[7u8; 32], MainNetwork, CP, 0).unwrap();
+    wallet.prime_for_sync_test(CP); // empty tree at the base checkpoint
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{CP}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // Pre-activation nodes report an all-zero finalsaplingroot.
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{}\"}}", "00".repeat(32)),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    // Must not throw: 2_700_000 < corrected activation 2_700_500, so skip.
+    wallet.sync(&client, 10).await.unwrap();
+    assert_eq!(wallet.last_synced_block(), CP);
+}
+
+/// last_processed == tip == an EXACT bundled-checkpoint height, node reports a
+/// DIFFERENT finalsaplingroot there (same-height reorg). The old
+/// closest-checkpoint gate (`last_processed > cp_height`) skipped the tip-root
+/// check at exactly a checkpoint height, letting orphaned shield state survive;
+/// this must diverge. FAILS before the gate removal, PASSES after.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_mismatch_at_checkpoint_diverges() {
+    use pivx_rpc::{Auth, PivxClient};
+    // A testnet checkpoint height well above real V5_0 activation (201), so
+    // get_checkpoint(CP).0 == CP and the old `> cp_height` gate was false.
+    const CP: i64 = 43200;
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.reload_from_checkpoint(CP);
+    assert_eq!(
+        wallet.last_synced_block(),
+        CP,
+        "CP must be an exact checkpoint"
+    );
+    wallet.prime_for_sync_test(CP);
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{CP}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    // A root that cannot equal the checkpoint tree's root.
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{}\"}}", "ff".repeat(32)),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    let err = wallet.sync(&client, 10).await.unwrap_err();
+    assert!(
+        matches!(err, WalletError::ScanDiverged { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Guard against a false positive from removing the gate: a fresh wallet sitting
+/// on its bundled checkpoint (last_processed == tip == checkpointHeight) whose
+/// node reports the MATCHING checkpoint root is a clean no-op, not a divergence.
+#[cfg(feature = "rpc")]
+#[tokio::test]
+async fn sync_tip_root_match_at_checkpoint_is_noop() {
+    use pivx_rpc::{Auth, PivxClient};
+    const CP: i64 = 43200;
+    let mut wallet = ShieldWallet::from_spending_key(EXTSK, TestNetwork, BIRTH).unwrap();
+    wallet.reload_from_checkpoint(CP);
+    wallet.prime_for_sync_test(CP);
+    let local_root = wallet.sapling_root().unwrap();
+
+    let mut results = std::collections::HashMap::new();
+    results.insert("getblockcount", format!("{CP}"));
+    results.insert("getblockhash", "\"deadbeef\"".to_string());
+    results.insert(
+        "getblock",
+        format!("{{\"finalsaplingroot\":\"{local_root}\"}}"),
+    );
+    let client = PivxClient::new(stub_node(results), Auth::None).unwrap();
+    wallet.sync(&client, 10).await.unwrap();
+    assert_eq!(wallet.last_synced_block(), CP);
 }
 
 /// send() must prove on the blocking pool, not the async runtime. On a

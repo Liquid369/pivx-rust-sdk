@@ -669,13 +669,30 @@ impl TransparentWallet {
         w.last_scanned = s.last_scanned;
         w.last_scanned_hash = s.last_scanned_hash;
         // Restore the reorg window (absent in older states → empty via serde
-        // default). Reject a negative height, matching the last_scanned guard.
+        // default). Honest save() output is sorted ascending, unique, at most
+        // REORG_WINDOW entries, every height <= last_scanned; the sync walk-back
+        // trusts that shape, so reject any window that violates it. Keep the
+        // per-entry negative-height check (matching the last_scanned guard).
+        if s.scanned_hashes.len() as i64 > REORG_WINDOW {
+            return Err(WalletError::Other(
+                "wallet state contains an invalid scanned-hash window".into(),
+            ));
+        }
+        let mut prev: Option<i64> = None;
         for e in &s.scanned_hashes {
             if e.height < 0 {
                 return Err(WalletError::Other(
                     "wallet state has a negative scanned-hash height".into(),
                 ));
             }
+            // Strictly ascending (implies unique) and no future entry (the
+            // newest window entry is the last scanned block).
+            if e.height > s.last_scanned || prev.is_some_and(|p| e.height <= p) {
+                return Err(WalletError::Other(
+                    "wallet state contains an invalid scanned-hash window".into(),
+                ));
+            }
+            prev = Some(e.height);
         }
         w.scanned_hashes = s
             .scanned_hashes
@@ -1080,6 +1097,49 @@ mod tests {
             panic!("load with the wrong seed must fail");
         };
         assert!(err.to_string().contains("does not match"));
+    }
+
+    /// load must reject a scanned-hash window that violates the shape honest
+    /// save() always emits (ascending, unique, ≤ REORG_WINDOW, all ≤ lastScanned),
+    /// because the sync walk-back trusts array order and entry heights.
+    fn state_with_window(last_scanned: i64, heights: &[i64]) -> ([u8; 32], String) {
+        let seed = [21u8; 32];
+        let w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let mut st: serde_json::Value = serde_json::from_str(&w.save()).unwrap();
+        st["lastScanned"] = serde_json::json!(last_scanned);
+        st["scannedHashes"] = serde_json::json!(heights
+            .iter()
+            .map(|h| serde_json::json!({ "height": h, "hash": "0b".repeat(32) }))
+            .collect::<Vec<_>>());
+        (seed, st.to_string())
+    }
+
+    #[test]
+    fn load_rejects_future_window_entry() {
+        let (seed, state) = state_with_window(50, &[51]);
+        let Err(err) = TransparentWallet::load(&seed, &state) else {
+            panic!("load must reject a window entry above lastScanned");
+        };
+        assert!(err.to_string().contains("invalid scanned-hash window"));
+    }
+
+    #[test]
+    fn load_rejects_non_ascending_window() {
+        let (seed, state) = state_with_window(60, &[50, 50]);
+        let Err(err) = TransparentWallet::load(&seed, &state) else {
+            panic!("load must reject a duplicate/non-ascending window");
+        };
+        assert!(err.to_string().contains("invalid scanned-hash window"));
+    }
+
+    #[test]
+    fn load_rejects_oversized_window() {
+        let heights: Vec<i64> = (1..=REORG_WINDOW + 1).collect();
+        let (seed, state) = state_with_window(REORG_WINDOW + 10, &heights);
+        let Err(err) = TransparentWallet::load(&seed, &state) else {
+            panic!("load must reject a window longer than REORG_WINDOW");
+        };
+        assert!(err.to_string().contains("invalid scanned-hash window"));
     }
 
     #[test]

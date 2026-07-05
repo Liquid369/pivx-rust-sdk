@@ -537,12 +537,15 @@ mod rpc_sync {
     use super::*;
     use pivx_rpc::PivxClient;
 
-    /// Heights at/after which a block must carry a sapling root. Below these
-    /// the node legitimately has none.
+    /// Threshold at/above which the sapling root check runs; below it we skip.
+    /// These are the exact UPGRADE_V5_0 activation heights (inclusive) from PIVX
+    /// consensus, so at/above them an honest node always reports a real,
+    /// matchable finalsaplingroot, and below them (no shielded txs yet) there is
+    /// nothing to verify. Mainnet V5_0 is 2_700_500; testnet is 201.
     fn sapling_activation(network: Network) -> i64 {
         match network {
-            Network::MainNetwork => 2_700_000,
-            Network::TestNetwork => 43_200,
+            Network::MainNetwork => 2_700_500,
+            Network::TestNetwork => 201,
         }
     }
 
@@ -663,22 +666,26 @@ mod rpc_sync {
             // set at our tip. The commitment tree can't be cheaply rewound, so
             // re-verify the tip's finalsaplingroot against our local root (the
             // same comparison the batch loop makes) and diverge on mismatch;
-            // the caller recovers via reload_from_checkpoint. Skip a wallet
-            // still sitting on its checkpoint (nothing scanned yet).
-            let (cp_height, _) = get_checkpoint(self.last_processed_block as i32, self.network);
-            if self.last_processed_block == tip && self.last_processed_block > cp_height as i64 {
-                let hash = client.get_block_hash(tip).await?;
-                let block = client.get_block(&hash, 1).await?;
-                let node_root = block["finalsaplingroot"].as_str().ok_or_else(|| {
-                    WalletError::Other(format!("node omitted finalsaplingroot at height {tip}"))
-                })?;
-                let local = self.sapling_root()?;
-                if local != node_root {
-                    return Err(WalletError::ScanDiverged {
-                        height: tip,
-                        local,
-                        node: node_root.to_string(),
-                    });
+            // the caller recovers via reload_from_checkpoint. Run this whenever
+            // last_processed == tip, including at an exact checkpoint height: a
+            // fresh wallet still on its checkpoint has a tree whose root equals
+            // the node's finalsaplingroot there (ensure_valid_checkpoint just
+            // confirmed it), so the match is a clean no-op, not a false positive.
+            // Route the fetch through node_sapling_root so the check is skipped
+            // below the sapling_activation threshold: below real V5_0 the node
+            // reports a zero root our non-zero empty tree can't match, so an
+            // honest wallet would false-diverge — the same activation exception
+            // ensure_valid_checkpoint already relies on.
+            if self.last_processed_block == tip {
+                if let Some(node_root) = node_sapling_root(client, tip, self.network).await? {
+                    let local = self.sapling_root()?;
+                    if local != node_root {
+                        return Err(WalletError::ScanDiverged {
+                            height: tip,
+                            local,
+                            node: node_root,
+                        });
+                    }
                 }
             }
             while self.last_processed_block < tip {
@@ -728,19 +735,35 @@ mod rpc_sync {
                 );
                 let result = (|| {
                     self.handle_blocks(&blocks)?;
-                    // A shielded chain always reports a sapling root; a missing
-                    // one means the node is lying or pre-activation. Refuse to
-                    // advance unverified rather than skipping the only check.
-                    let node_root = node_root.ok_or_else(|| {
-                        WalletError::Other(format!("node omitted finalsaplingroot at height {to}"))
-                    })?;
-                    let local = self.sapling_root()?;
-                    if local != node_root {
-                        return Err(WalletError::ScanDiverged {
-                            height: to,
-                            local,
-                            node: node_root,
-                        });
+                    // Verify the locally-built tree against the node's
+                    // finalsaplingroot, except below the sapling_activation
+                    // threshold, where we skip: below real V5_0 the node reports
+                    // a zero root our non-zero empty tree can't match, and no
+                    // shielded txs exist below activation anyway, so there is
+                    // nothing to verify. Both networks can scan into the skip
+                    // window: a testnet wallet with a below-activation birth
+                    // height resumes from the height-0 empty-tree checkpoint,
+                    // and a mainnet wallet resumes from checkpoint 2_700_000 and
+                    // scans the empty [2_700_001, 2_700_500) gap below its real
+                    // activation. Same exception node_sapling_root encodes.
+                    if to >= sapling_activation(self.network) {
+                        // A shielded chain always reports a sapling root; a
+                        // missing one past activation means the node is lying.
+                        // Refuse to advance unverified rather than skipping the
+                        // only check.
+                        let node_root = node_root.ok_or_else(|| {
+                            WalletError::Other(format!(
+                                "node omitted finalsaplingroot at height {to}"
+                            ))
+                        })?;
+                        let local = self.sapling_root()?;
+                        if local != node_root {
+                            return Err(WalletError::ScanDiverged {
+                                height: to,
+                                local,
+                                node: node_root,
+                            });
+                        }
                     }
                     Ok(())
                 })();

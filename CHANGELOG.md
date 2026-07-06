@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.0] - 2026-07-06
 
-Release of a full-repo audit cycle: `pivx-rpc` 0.6.0, `pivx-wallet` 0.4.0.
+Release of a full-repo audit cycle: `pivx-rpc` 0.7.0, `pivx-wallet` 0.7.0.
 
 ### Fixed
 

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-07-06
+
+Patch from a post-publish audit: `pivx-rpc` 0.7.1, `pivx-wallet` 0.7.1.
+
+### Fixed
+
+- `pivx-rpc`: the JSON-RPC response `id` is now verified before the error
+  branch on single calls, so a wrong-id reply — success or error — is
+  rejected (`Error::Json`) instead of being mis-attributed as this call's
+  `Error::Rpc`, which on a broadcast could otherwise release a pending spend
+  without the real `sendrawtransaction` response having arrived.
+- Docs: the crates.io install pin reads `pivx-rpc = "0.7"`, and the shared
+  docs reference the recovery API per SDK (`reloadFromCheckpoint` /
+  `reload_from_checkpoint`).
+
 ## [0.7.0] - 2026-07-06
 
 Release of a full-repo audit cycle: `pivx-rpc` 0.7.0, `pivx-wallet` 0.7.0.

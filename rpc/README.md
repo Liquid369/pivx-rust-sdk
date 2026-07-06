@@ -12,7 +12,7 @@ companion `pivx-wallet` crate.
 
 ```toml
 [dependencies]
-pivx-rpc = "0.6"
+pivx-rpc = "0.7"
 ```
 
 ## Usage

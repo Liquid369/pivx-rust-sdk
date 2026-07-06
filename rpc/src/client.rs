@@ -317,18 +317,10 @@ impl PivxClient {
             "params": params,
         });
         let (body, status) = self.send_rpc(&payload, method, timeout).await?;
-        if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
-            return Err(rpc_error(err, method));
-        }
-        if !(200..300).contains(&status) {
-            return Err(Error::Http {
-                status,
-                method: method.to_string(),
-            });
-        }
-        // Belt-and-braces: a success response must echo our request id — a
-        // mismatch means the reply is not for this request (broken proxy or
-        // desynced pipeline), so reject rather than mis-attribute the result.
+        // pivxd echoes the request id on BOTH success and error replies, so
+        // verify it before either branch: a mismatch means the reply is not for
+        // this request (broken proxy or desynced pipeline) and is not this
+        // call's result *or* error — reject rather than mis-attribute it.
         if body.get("id").and_then(Value::as_u64) != Some(id) {
             return Err(Error::Json {
                 method: method.to_string(),
@@ -336,6 +328,15 @@ impl PivxClient {
                     "response id {} does not match request id {id}",
                     body.get("id").cloned().unwrap_or(Value::Null)
                 )),
+            });
+        }
+        if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
+            return Err(rpc_error(err, method));
+        }
+        if !(200..300).contains(&status) {
+            return Err(Error::Http {
+                status,
+                method: method.to_string(),
             });
         }
         serde_json::from_value(body.get("result").cloned().unwrap_or(Value::Null)).map_err(

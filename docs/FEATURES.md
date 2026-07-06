@@ -193,7 +193,8 @@ broadcast relay.
 - `save()` / `load()`: versioned JSON wallet state (viewing key, sync
   position, commitment tree, notes, pending spends). The format is identical
   across the JS and Rust SDKs — a wallet saved by one loads in the other.
-- `reloadFromCheckpoint(height)`: reset scan state to a checkpoint and drop
+- `reloadFromCheckpoint(height)` (JS) / `reload_from_checkpoint(height)` (Rust):
+  reset scan state to a checkpoint and drop
   tracked notes; the recovery path after a divergence error. Needs no keys.
 - `sync` raises a divergence error (`ScanDivergedError` /
   `WalletError::ScanDiverged`) if the local tree stops matching the node,

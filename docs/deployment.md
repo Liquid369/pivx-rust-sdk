@@ -76,4 +76,5 @@ is a shared JSON format, so the scanner can hand state to the signer.
   send of the same notes.
 - For exact payouts leave fee headroom above the amount; only use sweep mode
   when intentionally emptying a balance.
-- If sync raises a divergence error, call `reloadFromCheckpoint` and re-sync.
+- If sync raises a divergence error, call `reloadFromCheckpoint` (JS) /
+  `reload_from_checkpoint` (Rust) and re-sync.

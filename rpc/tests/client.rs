@@ -982,6 +982,25 @@ async fn mismatched_response_id_is_rejected() {
 }
 
 #[tokio::test]
+async fn mismatched_response_id_on_error_reply_is_rejected() {
+    // R5-1: pivxd echoes the request id on error replies too, so a wrong-id
+    // error body is malformed and must be rejected as Error::Json — not
+    // surfaced as this call's Error::Rpc.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":null,"error":{"code":-1,"message":"boom"},"id":999}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    match client.get_block_count().await.unwrap_err() {
+        Error::Json { method, source } => {
+            assert_eq!(method, "getblockcount");
+            assert!(source.to_string().contains("id"), "got: {source}");
+        }
+        other => panic!("expected Json error (id mismatch), got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn shield_watcher_default_min_conf_one_explicit_zero_passes_through() {
     // P3: WatchOptions::default() polls with min_conf 1 — the JS SDK default —
     // while an explicit 0 (include unconfirmed notes; the node accepts it)

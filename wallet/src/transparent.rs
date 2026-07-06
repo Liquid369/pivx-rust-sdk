@@ -198,6 +198,25 @@ pub fn derive_key(
     change: u32,
     index: u32,
 ) -> Result<TransparentKey, WalletError> {
+    // Root-cause seed-length gate: the transparent constructor routes through
+    // here, so validating the 32/64-byte contract at the top of derive_key
+    // covers every caller (BIP32 uses the FULL seed). Same text as the
+    // constructor.
+    if seed.len() != 32 && seed.len() != 64 {
+        return Err(WalletError::Other(
+            "seed must be 32 bytes (raw) or 64 bytes (BIP39)".into(),
+        ));
+    }
+    // `account` is hardened via `account | HARDENED` below, so a value already
+    // in the hardened range (>= 0x8000_0000) would alias a lower account and
+    // emit a state that load() rejects. Reject it with a labeled error rather
+    // than deriving a silently-wrong key. (change/index are non-hardened u32,
+    // so every value is valid.)
+    if account >= HARDENED {
+        return Err(WalletError::InvalidKey(format!(
+            "account must be < 2^31 (BIP32 hardened range), got {account}"
+        )));
+    }
     let secp = Secp256k1::new();
     let path = [
         44 | HARDENED,
@@ -222,12 +241,14 @@ pub fn derive_key(
 mod tests {
     use super::*;
 
-    // BIP32 test vector 1 (master seed 000102...0f), external chain m/0'/... roots.
+    // Full derivation over a 32-byte seed (within the 32/64-byte contract
+    // derive_key now enforces), external chain m/44'/119'/0'/0/0.
     #[test]
     fn bip32_master_matches_vector() {
         // m/44'/119'/0'/0/0 must be deterministic; verify the whole path runs
         // and yields a valid compressed pubkey + decodable address.
-        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .unwrap();
         let k = derive_key(&seed, Network::MainNetwork, 0, 0, 0).unwrap();
         let addr = k.address();
         assert!(addr.starts_with('D'), "mainnet P2PKH starts with D: {addr}");
@@ -245,6 +266,28 @@ mod tests {
         let c = derive_key(&seed, Network::MainNetwork, 0, 0, 1).unwrap();
         assert_eq!(a.address(), b.address());
         assert_ne!(a.address(), c.address());
+    }
+
+    #[test]
+    fn derive_key_rejects_non_32_or_64_seed() {
+        // The exported derive_key enforces the 32/64-byte seed contract at its
+        // top (the transparent constructor routes through it), so an
+        // out-of-contract length can no longer bypass the check.
+        for len in [16usize, 33, 48] {
+            assert!(derive_key(&vec![1u8; len], Network::MainNetwork, 0, 0, 0).is_err());
+        }
+        assert!(derive_key(&[1u8; 32], Network::MainNetwork, 0, 0, 0).is_ok());
+        assert!(derive_key(&[1u8; 64], Network::MainNetwork, 0, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn derive_key_rejects_hardened_range_account() {
+        let seed = [7u8; 32];
+        // account 2^31 is in the hardened range; `account | HARDENED` would
+        // alias account 0 and emit a state load() rejects. Reject up front.
+        assert!(derive_key(&seed, Network::MainNetwork, 0x8000_0000, 0, 0).is_err());
+        // 2^31-1 is the largest valid account.
+        assert!(derive_key(&seed, Network::MainNetwork, 0x7fff_ffff, 0, 0).is_ok());
     }
 
     #[test]

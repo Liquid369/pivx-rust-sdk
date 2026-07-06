@@ -5,6 +5,12 @@
 //! PIVX has no address index, so UTXOs are discovered either by scanning
 //! blocks ([`scan`](TransparentWallet::scan)) or supplied by the caller
 //! ([`add_utxo`](TransparentWallet::add_utxo)).
+//!
+//! Output recognition is deliberately narrow: only standard P2PKH outputs
+//! (and the OP_EXCHANGEADDR-prefixed EXM encoding, which pays the same key)
+//! are credited. P2PK outputs and cold-staking (P2CS) delegations paying our
+//! keys are NOT detected — this wallet's transaction builder can only spend
+//! P2PKH/EXM inputs, so crediting them would create unspendable balance.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +27,10 @@ use crate::transparent_tx::{build_transparent_tx, script_pubkey_for_address, TxI
 /// resetting a fixed window and re-scanning lets the UTXO model self-heal.
 /// Identical to the JS SDK's `REORG_WINDOW` for cross-SDK parity.
 const REORG_WINDOW: i64 = 100;
+
+/// Upper bound for persisted heights/counters: JS `Number.MAX_SAFE_INTEGER`.
+/// Both SDKs cap heights here so a saved state loads in both or neither.
+const MAX_JS_SAFE: i64 = (1 << 53) - 1;
 
 /// A tracked unspent transparent output we can spend.
 #[derive(Clone)]
@@ -54,6 +64,12 @@ fn coinbase_maturity(network: Network) -> i64 {
         Network::MainNetwork => 100,
         Network::TestNetwork => 15,
     }
+}
+
+/// 64 lowercase-or-uppercase hex chars — the only txid shape
+/// [`save`](TransparentWallet::save)'s state format round-trips.
+fn is_txid(t: &str) -> bool {
+    t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A confirmed transparent output as seen in a scanned transaction.
@@ -151,6 +167,15 @@ impl TransparentWallet {
     /// account `account`. Only outputs to these addresses are recognized, so
     /// `gap` bounds how many unused addresses ahead are watched.
     pub fn new(seed: &[u8], network: Network, account: u32, gap: u32) -> Result<Self, WalletError> {
+        // Accept a 32-byte raw seed OR a 64-byte BIP39 seed (MyPIVXWallet /
+        // BIP39 seed-phrase wallets). BIP32 transparent derivation uses the
+        // FULL seed, so a 64-byte BIP39 seed reproduces MyPIVXWallet (MPW) /
+        // BIP39 seed-phrase wallet addresses.
+        if seed.len() != 32 && seed.len() != 64 {
+            return Err(WalletError::Other(
+                "seed must be 32 bytes (raw) or 64 bytes (BIP39)".into(),
+            ));
+        }
         let mut keys = HashMap::new();
         let mut external = Vec::new();
         let mut change = Vec::new();
@@ -243,6 +268,11 @@ impl TransparentWallet {
     /// Add a caller-supplied UTXO if it pays one of our addresses. Assumed a
     /// normal (non-coinbase) spendable output; use `scan_block` for chain data
     /// where coinbase maturity is tracked.
+    ///
+    /// Returns false (not ours / not accepted) for values
+    /// [`save`](Self::save)'s state format cannot round-trip: a non-64-hex
+    /// txid, or an amount above the JS safe-integer bound (2^53 - 1).
+    /// Accepting them would brick a later [`load`](Self::load).
     pub fn add_utxo(&mut self, txid: &str, vout: u32, amount: u64, script_pubkey: Vec<u8>) -> bool {
         self.insert_utxo(txid, vout, amount, script_pubkey, false, 0)
     }
@@ -256,6 +286,12 @@ impl TransparentWallet {
         coinbase: bool,
         height: i64,
     ) -> bool {
+        // Apply load()'s validation predicates at insertion: anything the
+        // state format cannot round-trip (in either SDK) is rejected here
+        // instead of bricking a later load().
+        if !is_txid(txid) || amount > (1u64 << 53) - 1 {
+            return false;
+        }
         match Self::owned_script_hash(&script_pubkey) {
             Some(h) if self.keys.contains_key(&h) => {
                 self.utxos.insert(
@@ -305,15 +341,29 @@ impl TransparentWallet {
     /// `last_scanned + 1`) but its `previousblockhash` differs from the hash
     /// we recorded: the chain reorganized under us. Recover with
     /// [`reset_scan`](Self::reset_scan) below the fork point and re-sync.
-    /// Height jumps skip the continuity check.
+    /// Height jumps skip the continuity check. Also errors (state untouched)
+    /// when `height` is missing or not an integer in [0, 2^53-1] — the bound
+    /// both SDKs' state formats round-trip.
     pub fn scan_block(&mut self, block: &serde_json::Value) -> Result<(), WalletError> {
-        let block_height = block["height"].as_i64();
-        if let (Some(local), Some(h)) = (self.last_scanned_hash.as_ref(), block_height) {
-            if h == self.last_scanned + 1 {
+        // A missing/negative/fractional height would poison last_scanned and
+        // brick the next load(), and one above 2^53-1 would load here but not
+        // in the JS SDK. Both SDKs bound heights to [0, 2^53-1] so a saved
+        // state loads in both or neither. Reject before mutating anything.
+        let height = match block["height"].as_i64() {
+            Some(h) if (0..=MAX_JS_SAFE).contains(&h) => h,
+            _ => {
+                return Err(WalletError::Other(format!(
+                    "scan_block: block height must be an integer in [0, 2^53-1], got {}",
+                    block["height"]
+                )));
+            }
+        };
+        if let Some(local) = self.last_scanned_hash.as_ref() {
+            if height == self.last_scanned + 1 {
                 if let Some(prev) = block["previousblockhash"].as_str() {
                     if prev != local {
                         return Err(WalletError::ScanDiverged {
-                            height: h,
+                            height,
                             local: local.clone(),
                             node: prev.to_string(),
                         });
@@ -321,13 +371,22 @@ impl TransparentWallet {
                 }
             }
         }
-        if let Some(h) = block_height {
-            self.last_scanned = h;
-        }
+        self.last_scanned = height;
         self.last_scanned_hash = block["hash"].as_str().map(str::to_string);
         // Record this block in the rolling window (same hash guard as
         // last_scanned_hash), trimming to the last REORG_WINDOW entries.
+        // Re-scanning an already-recorded height (e.g. replaying a block
+        // after a manual reset) first drops stale entries at/above it —
+        // mirroring reset_scan's trim — so the window stays strictly
+        // ascending, which load() requires.
         if let Some(hash) = self.last_scanned_hash.clone() {
+            while self
+                .scanned_hashes
+                .last()
+                .is_some_and(|(h, _)| *h >= self.last_scanned)
+            {
+                self.scanned_hashes.pop();
+            }
             self.scanned_hashes.push((self.last_scanned, hash));
             let overflow = self
                 .scanned_hashes
@@ -337,7 +396,6 @@ impl TransparentWallet {
                 self.scanned_hashes.drain(0..overflow);
             }
         }
-        let height = self.last_scanned;
         let Some(txs) = block["tx"].as_array() else {
             return Ok(());
         };
@@ -346,12 +404,16 @@ impl TransparentWallet {
                 continue;
             };
             // Coinbase: first vin carries `coinbase` and no prevout. Coinstake
-            // (PoS): a spending vin plus an empty vout[0] (zero value). Both
-            // are maturity-gated for spending (src/txmempool.cpp).
+            // (PoS): a spending vin plus an EMPTY vout[0] — zero value AND
+            // empty script, per CTxOut::IsEmpty (src/primitives/transaction.h).
+            // Checking value alone would maturity-gate e.g. a zero-value
+            // OP_RETURN tx paying us. Both are maturity-gated for spending
+            // (src/txmempool.cpp).
             let first_vin = tx["vin"].get(0);
             let is_coinbase = first_vin.is_some_and(|v| v.get("coinbase").is_some());
             let is_coinstake = first_vin.is_some_and(|v| v.get("txid").is_some())
-                && tx["vout"][0]["value"].as_f64() == Some(0.0);
+                && tx["vout"][0]["value"].as_f64() == Some(0.0)
+                && tx["vout"][0]["scriptPubKey"]["hex"].as_str() == Some("");
             let coinbase = is_coinbase || is_coinstake;
             for vout in tx["vout"].as_array().into_iter().flatten() {
                 let (Some(n), Some(value), Some(hex_str)) = (
@@ -361,12 +423,22 @@ impl TransparentWallet {
                 ) else {
                     continue;
                 };
+                // Skip hostile vouts rather than mangling them: an
+                // out-of-u32 index must not be truncated into someone
+                // else's outpoint, and a negative value must not be
+                // clamped to 0 (same skip semantics as the JS scanner).
+                let Ok(n) = u32::try_from(n) else {
+                    continue;
+                };
+                if value < 0.0 {
+                    continue;
+                }
                 let Ok(script) = hex::decode(hex_str) else {
                     continue;
                 };
                 self.insert_utxo(
                     txid,
-                    n as u32,
+                    n,
                     (value * 1e8).round() as u64,
                     script,
                     coinbase,
@@ -392,11 +464,33 @@ impl TransparentWallet {
     /// Recovery after [`scan_block`](Self::scan_block) returns
     /// [`ScanDiverged`](WalletError::ScanDiverged): reset to a height below
     /// the fork point, then re-sync. Drops every scanned UTXO (height > 0)
-    /// above `height` along with its pending reservation, and trims the reorg
-    /// window to `height` — restoring the stored block hash from the retained
-    /// window entry at `height`, or clearing it if none. Caller-supplied UTXOs
-    /// (height 0) are kept.
-    pub fn reset_scan(&mut self, height: i64) {
+    /// above `height` and trims the reorg window to `height` — restoring the
+    /// stored block hash from the retained window entry at `height`, or
+    /// clearing it if none. Caller-supplied UTXOs (height 0) are kept.
+    /// Reservations made by [`build_send`](Self::build_send) are PRESERVED:
+    /// the re-scan may re-credit the same outpoints, and releasing them here
+    /// would let a second send double-select inputs of a still-in-flight
+    /// transaction. A reservation to an outpoint that never comes back is
+    /// inert; a scan that observes the spend clears it, as do
+    /// [`mark_spent`](Self::mark_spent) and [`release`](Self::release).
+    ///
+    /// Errors if `height` is above the last scanned block: reset_scan can
+    /// only rewind — "resetting" forward would silently skip the blocks in
+    /// between.
+    pub fn reset_scan(&mut self, height: i64) -> Result<(), WalletError> {
+        // A negative reset height would poison last_scanned (and drop UTXOs)
+        // before bricking the next load(). Reject before mutating.
+        if height < 0 {
+            return Err(WalletError::Other(format!(
+                "reset_scan height must be non-negative, got {height}"
+            )));
+        }
+        if height > self.last_scanned {
+            return Err(WalletError::Other(format!(
+                "reset_scan height {height} is above the last scanned block {}",
+                self.last_scanned
+            )));
+        }
         let dropped: Vec<(String, u32)> = self
             .utxos
             .iter()
@@ -405,7 +499,6 @@ impl TransparentWallet {
             .collect();
         for k in &dropped {
             self.utxos.remove(k);
-            self.pending.remove(k);
         }
         self.last_scanned = height;
         // Trim the window to entries at/below the reset height and restore the
@@ -419,14 +512,35 @@ impl TransparentWallet {
             .rev()
             .find(|(h, _)| *h == height)
             .map(|(_, hash)| hash.clone());
+        Ok(())
     }
 
-    /// Total spendable transparent balance in satoshis, excluding outpoints
-    /// reserved by an unfinalized [`build_send`](Self::build_send).
+    /// Total transparent balance in satoshis, excluding outpoints reserved
+    /// by an unfinalized [`build_send`](Self::build_send). Immature coinbase/
+    /// coinstake outputs ARE counted here even though `build_send` cannot
+    /// spend them yet — use [`spendable_balance`](Self::spendable_balance)
+    /// for what a send can use.
     pub fn balance(&self) -> u64 {
         self.utxos
             .values()
             .filter(|u| !self.pending.contains(&(u.txid.clone(), u.vout)))
+            .map(|u| u.amount)
+            .fold(0u64, |a, v| a.saturating_add(v))
+    }
+
+    /// Balance actually selectable by [`build_send`](Self::build_send) right
+    /// now: like [`balance`](Self::balance) but also excluding immature
+    /// coinbase/coinstake outputs (the same maturity filter build_send
+    /// applies).
+    pub fn spendable_balance(&self) -> u64 {
+        let maturity = coinbase_maturity(self.network);
+        self.utxos
+            .values()
+            .filter(|u| !self.pending.contains(&(u.txid.clone(), u.vout)))
+            .filter(|u| {
+                !(u.coinbase
+                    && self.last_scanned.saturating_sub(u.height).saturating_add(1) < maturity)
+            })
             .map(|u| u.amount)
             .fold(0u64, |a, v| a.saturating_add(v))
     }
@@ -438,9 +552,19 @@ impl TransparentWallet {
         self.utxos.values()
     }
 
-    /// Estimated size (bytes) of a P2PKH tx with the given input/output counts.
-    fn est_size(n_in: usize, n_out: usize) -> u64 {
-        (n_in as u64) * 148 + (n_out as u64) * 34 + 10
+    /// Serialized size (bytes) of one output: 8-byte value + scriptPubKey
+    /// varint + script. An EXM output is a 26-byte script (35 bytes total),
+    /// not the 34 a flat P2PKH assumes — undercounting it makes min-feerate
+    /// exchange sends underpay and get node-rejected.
+    fn output_size(script_len: usize) -> u64 {
+        8 + if script_len < 0xfd { 1 } else { 3 } + script_len as u64
+    }
+
+    /// Estimated tx size (bytes) for `n_in` P2PKH inputs and `out_bytes` of
+    /// serialized outputs (summed via [`output_size`](Self::output_size)).
+    fn est_size(n_in: usize, out_bytes: u64) -> u64 {
+        // +2: the input-count varint grows from 1 to 3 bytes at 253 inputs.
+        (n_in as u64) * 148 + out_bytes + 10 + if n_in >= 253 { 2 } else { 0 }
     }
 
     /// Build and sign a transparent send of `amount` sats to `to`, selecting
@@ -458,10 +582,12 @@ impl TransparentWallet {
                 "amount must be greater than zero".into(),
             ));
         }
-        // A zero feerate would build a valid-looking but unrelayable tx.
-        if fee_per_byte == Some(0) {
+        // Below 10 sat/byte the node will not relay the tx: minRelayTxFee is
+        // 10000 sat/kB (PIVX src/validation.cpp).
+        if fee_per_byte.is_some_and(|f| f < 10) {
             return Err(WalletError::Other(
-                "fee_per_byte must be greater than zero".into(),
+                "fee_per_byte must be at least 10 sat/byte (node minRelayTxFee = 10000 sat/kB)"
+                    .into(),
             ));
         }
         let dest = decode_address(to)?;
@@ -487,6 +613,10 @@ impl TransparentWallet {
             ));
         }
         let feerate = fee_per_byte.unwrap_or(100);
+        // Size outputs by their real scriptPubKey length: the recipient's actual
+        // script (P2PKH 25, EXM 26, P2SH 23) plus a P2PKH change output (25).
+        // Selection conservatively assumes change is emitted (2 outputs).
+        let out_bytes = Self::output_size(to_script.len()) + Self::output_size(25);
 
         // Exclude immature coinbase/coinstake outputs: the node rejects a spend
         // of one before nCoinbaseMaturity confirmations. Depth is measured
@@ -496,22 +626,44 @@ impl TransparentWallet {
         let mut avail: Vec<&OwnedUtxo> = self
             .utxos
             .values()
-            .filter(|u| !(u.coinbase && self.last_scanned - u.height + 1 < maturity))
+            .filter(|u| {
+                !(u.coinbase
+                    && self.last_scanned.saturating_sub(u.height).saturating_add(1) < maturity)
+            })
             .filter(|u| !self.pending.contains(&(u.txid.clone(), u.vout)))
             .collect();
         avail.sort_by_key(|u| std::cmp::Reverse(u.amount)); // largest first
 
+        // An absurd fee_per_byte must error, not wrap in release builds.
+        let checked_fee = |n_in: usize| {
+            feerate
+                .checked_mul(Self::est_size(n_in, out_bytes))
+                .ok_or_else(|| {
+                    WalletError::Other(
+                        "fee computation overflows: fee_per_byte is too large".into(),
+                    )
+                })
+        };
         let mut selected: Vec<OwnedUtxo> = Vec::new();
         let mut total: u64 = 0;
         for u in avail {
             selected.push(u.clone());
             total = total.saturating_add(u.amount);
-            let fee = feerate * Self::est_size(selected.len(), 2);
+            // At/above MAX_STANDARD_TX_SIZE (100000, PIVX src/validation.h)
+            // the node will never relay or mine the tx — policy rejects at
+            // `sz >= 100000` (src/policy/policy.cpp) — so building it would
+            // only doom it.
+            if Self::est_size(selected.len(), out_bytes) >= 100_000 {
+                return Err(WalletError::Other(
+                    "transaction would exceed the 100kB standard size (too many small inputs); consolidate UTXOs first".into(),
+                ));
+            }
+            let fee = checked_fee(selected.len())?;
             if total >= amount.saturating_add(fee) {
                 break;
             }
         }
-        let fee = feerate * Self::est_size(selected.len(), 2);
+        let fee = checked_fee(selected.len())?;
         if total < amount.saturating_add(fee) {
             return Err(WalletError::InsufficientBalance);
         }
@@ -525,7 +677,9 @@ impl TransparentWallet {
         // (else the whole tx is rejected as dust) and the fee to later spend
         // the change input (else it is not economically worth keeping). Change
         // is always P2PKH (25-byte script).
-        if change_val > std::cmp::max(feerate * 148, dust_threshold(25)) {
+        // saturating_mul: cannot exceed `fee` (est_size >= 226 > 148), which
+        // checked_mul above already proved fits — saturation is belt-and-braces.
+        if change_val > std::cmp::max(feerate.saturating_mul(148), dust_threshold(25)) {
             let ch_hash = self.next_change_hash()?;
             let ch_addr =
                 crate::transparent::encode_address(&ch_hash, self.network, AddressKind::P2pkh);
@@ -658,9 +812,12 @@ impl TransparentWallet {
                 "wallet state account exceeds the BIP32 hardened range".into(),
             ));
         }
-        if s.last_scanned < 0 {
+        // Bound last_scanned to [0, 2^53-1], symmetric with scan_block, so a
+        // hostile huge height can't overflow the maturity math or load here but
+        // not in the JS SDK.
+        if !(0..=MAX_JS_SAFE).contains(&s.last_scanned) {
             return Err(WalletError::Other(
-                "wallet state has a negative last-scanned height".into(),
+                "wallet state last-scanned height must be in [0, 2^53-1]".into(),
             ));
         }
         let mut w = Self::new(seed, network, s.account, s.gap)?;
@@ -699,12 +856,14 @@ impl TransparentWallet {
             .into_iter()
             .map(|e| (e.height, e.hash))
             .collect();
-        let is_txid = |t: &str| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit());
         for u in s.utxos {
             // Same bounds as the JS SDK so a state either loads in both or
             // neither: 64-hex txid, amount within JS safe-integer range,
             // non-negative height.
-            if !is_txid(&u.txid) || u.amount > (1u64 << 53) - 1 || u.height < 0 {
+            if !is_txid(&u.txid)
+                || u.amount > (1u64 << 53) - 1
+                || !(0..=MAX_JS_SAFE).contains(&u.height)
+            {
                 return Err(WalletError::Other("malformed utxo in state".into()));
             }
             let script_pubkey = hex::decode(&u.script_pubkey)
@@ -797,7 +956,7 @@ impl TransparentWallet {
                         }
                     }
                     match fork {
-                        Some(f) => self.reset_scan(f),
+                        Some(f) => self.reset_scan(f)?,
                         None => {
                             return Err(WalletError::ScanDiverged {
                                 height: self.last_scanned,
@@ -1214,13 +1373,14 @@ mod tests {
         assert_eq!(w.last_scanned_block(), 100);
         assert_eq!(w.utxos().count(), 2);
 
-        // Recover below the fork: scanned UTXO and its reservation dropped,
-        // caller-supplied one kept.
-        w.reset_scan(99);
+        // Recover below the fork: the scanned UTXO is dropped but its
+        // reservation is PRESERVED (the tx spending it may still be in
+        // flight); the caller-supplied UTXO is kept.
+        w.reset_scan(99).unwrap();
         assert_eq!(w.last_scanned_block(), 99);
         assert_eq!(w.balance(), 50_000_000);
         let st: serde_json::Value = serde_json::from_str(&w.save()).unwrap();
-        assert!(st["pending"].as_array().unwrap().is_empty());
+        assert_eq!(st["pending"].as_array().unwrap().len(), 1);
         assert!(st["lastScannedHash"].is_null());
 
         // Re-scan block 100, then a height jump (105) with an unrelated
@@ -1371,7 +1531,15 @@ mod tests {
                 }
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let result = handler(&req);
-                let body = format!("{{\"result\":{result},\"error\":null,\"id\":0}}");
+                // Echo the request id: the client verifies response id ==
+                // request id and rejects a mismatched reply.
+                let id: u64 = req
+                    .split("\"id\":")
+                    .nth(1)
+                    .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let body = format!("{{\"result\":{result},\"error\":null,\"id\":{id}}}");
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1545,5 +1713,401 @@ mod tests {
         assert_eq!(w.balance(), 200_000_000);
         assert_eq!(w.utxos().count(), 1);
         assert!(w.utxos().all(|u| u.txid == "e9".repeat(32)));
+    }
+
+    /// C1: selecting past MAX_STANDARD_TX_SIZE (100000, PIVX validation.h)
+    /// must error with consolidation guidance instead of building a tx the
+    /// network will never relay.
+    #[test]
+    fn build_send_caps_at_standard_tx_size() {
+        let seed = [30u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let s0 = spk(&p2pkh_address(&a0.public_key, MainNetwork));
+        // 700 dust UTXOs: satisfying the send needs > 675 inputs (> 100kB).
+        for i in 0..700u32 {
+            assert!(w.add_utxo(&format!("{i:064x}"), 0, 10_000, s0.clone()));
+        }
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        let err = w.build_send(&dest, 6_000_000, Some(10)).unwrap_err();
+        assert!(err.to_string().contains("100kB"), "got: {err}");
+        assert!(err.to_string().contains("consolidate"));
+    }
+
+    /// C2: an absurd fee_per_byte must yield a labeled error, not wrap
+    /// (release) or panic (debug) in the fee multiplication.
+    #[test]
+    fn build_send_errors_on_fee_overflow() {
+        let seed = [31u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        w.add_utxo(
+            "cc".repeat(32).as_str(),
+            0,
+            200_000_000,
+            spk(&p2pkh_address(&a0.public_key, MainNetwork)),
+        );
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        let err = w
+            .build_send(&dest, 100_000_000, Some(u64::MAX))
+            .unwrap_err();
+        assert!(err.to_string().contains("overflows"), "got: {err}");
+    }
+
+    /// C3: coinstake detection requires vout[0] to be EMPTY (zero value AND
+    /// empty script, CTxOut::IsEmpty). A zero-value OP_RETURN vout[0] tx
+    /// paying us must NOT be maturity-gated; a true coinstake still is.
+    #[test]
+    fn zero_value_opreturn_vout0_is_not_coinstake() {
+        let seed = [32u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        // Zero-value OP_RETURN at vout[0] (script "6a", not empty), pays us at
+        // vout 1: an ordinary tx, spendable with one confirmation.
+        w.scan_block(&serde_json::json!({
+            "height": 100,
+            "tx": [{
+                "txid": "55".repeat(32),
+                "vin": [{ "txid": "44".repeat(32), "vout": 0 }],
+                "vout": [
+                    { "n": 0, "value": 0.0, "scriptPubKey": { "hex": "6a" } },
+                    { "n": 1, "value": 2.0, "scriptPubKey": { "hex": spk_hex } },
+                ],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 200_000_000);
+        assert!(w.build_send(&dest, 100_000_000, Some(100)).is_ok());
+
+        // A true coinstake (empty vout[0]: value 0 AND script "") IS gated.
+        let mut w2 = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        w2.scan_block(&serde_json::json!({
+            "height": 100,
+            "tx": [{
+                "txid": "66".repeat(32),
+                "vin": [{ "txid": "44".repeat(32), "vout": 0 }],
+                "vout": [
+                    { "n": 0, "value": 0.0, "scriptPubKey": { "hex": "" } },
+                    { "n": 1, "value": 2.0, "scriptPubKey": { "hex": spk_hex } },
+                ],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(w2.balance(), 200_000_000);
+        assert!(matches!(
+            w2.build_send(&dest, 100_000_000, Some(100)),
+            Err(WalletError::InsufficientBalance)
+        ));
+    }
+
+    /// C4: add_utxo must reject what load() rejects — otherwise a wallet can
+    /// save() a state it can never load() again.
+    #[test]
+    fn add_utxo_rejects_what_load_rejects() {
+        let seed = [33u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let s0 = spk(&p2pkh_address(&a0.public_key, MainNetwork));
+        // Non-hex and short txids.
+        assert!(!w.add_utxo("zz".repeat(32).as_str(), 0, 1000, s0.clone()));
+        assert!(!w.add_utxo("abcd", 0, 1000, s0.clone()));
+        // Amount above the JS safe-integer bound (2^53 - 1).
+        assert!(!w.add_utxo("aa".repeat(32).as_str(), 0, 1u64 << 53, s0.clone()));
+        assert_eq!(w.utxos().count(), 0);
+        // A valid UTXO is still accepted and the state round-trips.
+        assert!(w.add_utxo("aa".repeat(32).as_str(), 0, 1000, s0.clone()));
+        assert!(TransparentWallet::load(&seed, &w.save()).is_ok());
+    }
+
+    /// C5: re-scanning an already-scanned block must not push a duplicate
+    /// window entry that load() then rejects (save/load self-brick).
+    #[test]
+    fn rescan_same_block_saves_and_loads() {
+        let seed = [34u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let block = serde_json::json!({ "height": 100, "hash": "aa".repeat(32), "tx": [] });
+        w.scan_block(&block).unwrap();
+        w.scan_block(&block).unwrap(); // e.g. a replay after a crash-restore
+        assert_eq!(w.last_scanned_block(), 100);
+        let json = w.save();
+        let r = TransparentWallet::load(&seed, &json);
+        assert!(r.is_ok(), "state after a re-scan must load");
+        assert_eq!(r.map(|r| r.save()).ok().as_deref(), Some(json.as_str()));
+    }
+
+    /// C6: a build_send reservation must survive reset_scan — after the
+    /// re-scan re-credits the outpoint, a second send must not double-select
+    /// the inputs of the still-in-flight first send.
+    #[test]
+    fn reservation_survives_reset_scan() {
+        let seed = [35u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let s0 = spk(&p2pkh_address(&a0.public_key, MainNetwork));
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        let block = serde_json::json!({
+            "height": 100,
+            "hash": "aa".repeat(32),
+            "tx": [{
+                "txid": "e1".repeat(32),
+                "vin": [{ "txid": "f1".repeat(32), "vout": 0 }],
+                "vout": [{ "n": 0, "value": 2.0, "scriptPubKey": { "hex": hex::encode(&s0) } }],
+            }],
+        });
+        w.scan_block(&block).unwrap();
+        let (_, spent) = w.build_send(&dest, 100_000_000, Some(100)).unwrap(); // reserves e1:0
+        w.reset_scan(99).unwrap(); // reorg walk-back: drops the UTXO, keeps the reservation
+        w.scan_block(&block).unwrap(); // re-scan re-credits e1:0
+                                       // Still reserved: the only UTXO must not be selectable again.
+        assert!(matches!(
+            w.build_send(&dest, 100_000_000, Some(100)),
+            Err(WalletError::InsufficientBalance)
+        ));
+        // release (or a scan-observed spend / mark_spent) frees it.
+        w.release(&spent);
+        assert!(w.build_send(&dest, 100_000_000, Some(100)).is_ok());
+    }
+
+    /// C7: feerates below the node's relay floor (minRelayTxFee = 10000/kB =
+    /// 10 sat/byte, PIVX validation.cpp) are rejected with the minimum named.
+    #[test]
+    fn build_send_rejects_sub_relay_feerate() {
+        let seed = [36u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        w.add_utxo(
+            "cc".repeat(32).as_str(),
+            0,
+            200_000_000,
+            spk(&p2pkh_address(&a0.public_key, MainNetwork)),
+        );
+        let dest = p2pkh_address(&a0.public_key, MainNetwork);
+        let err = w.build_send(&dest, 100_000_000, Some(9)).unwrap_err();
+        assert!(err.to_string().contains("minRelayTxFee"), "got: {err}");
+        assert!(w.build_send(&dest, 100_000_000, Some(10)).is_ok());
+    }
+
+    /// C8: reset_scan can only rewind — a height above last_scanned would
+    /// silently skip the blocks in between.
+    #[test]
+    fn reset_scan_rejects_forward_height() {
+        let seed = [37u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        w.scan_block(&serde_json::json!({ "height": 100, "hash": "aa".repeat(32), "tx": [] }))
+            .unwrap();
+        let err = w.reset_scan(150).unwrap_err();
+        assert!(
+            err.to_string().contains("above the last scanned"),
+            "got: {err}"
+        );
+        assert_eq!(w.last_scanned_block(), 100); // nothing mutated
+        w.reset_scan(100).unwrap(); // rewind-to-current is a no-op, still fine
+    }
+
+    /// C9: hostile vout entries are SKIPPED, never mangled — a negative value
+    /// must not be clamped to 0 and an out-of-u32 index must not be truncated
+    /// into another outpoint.
+    #[test]
+    fn scan_skips_negative_value_and_oversized_vout() {
+        let seed = [38u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        w.scan_block(&serde_json::json!({
+            "height": 10,
+            "tx": [{
+                "txid": "ee".repeat(32),
+                "vin": [{ "txid": "ff".repeat(32), "vout": 0 }],
+                "vout": [
+                    { "n": 0, "value": -1.0, "scriptPubKey": { "hex": spk_hex } },
+                    { "n": 4_294_967_296u64, "value": 1.0, "scriptPubKey": { "hex": spk_hex } },
+                    { "n": 1, "value": 1.0, "scriptPubKey": { "hex": spk_hex } },
+                ],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(w.utxos().count(), 1); // only the valid vout credited
+        assert_eq!(w.balance(), 100_000_000);
+        assert!(TransparentWallet::load(&seed, &w.save()).is_ok());
+    }
+
+    /// C12: spendable_balance applies build_send's maturity filter; balance
+    /// deliberately does not.
+    #[test]
+    fn spendable_balance_excludes_immature_coinbase() {
+        let seed = [39u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        w.scan_block(&serde_json::json!({
+            "height": 100,
+            "tx": [{
+                "txid": "dd".repeat(32),
+                "vin": [{ "coinbase": "00" }],
+                "vout": [{ "n": 0, "value": 5.0, "scriptPubKey": { "hex": spk_hex } }],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 500_000_000); // counted...
+        assert_eq!(w.spendable_balance(), 0); // ...but not yet spendable
+        w.scan_block(&serde_json::json!({ "height": 199, "tx": [] }))
+            .unwrap(); // 100 confirmations: mature
+        assert_eq!(w.spendable_balance(), 500_000_000);
+    }
+
+    /// W2: an invalid block height (negative/fractional/missing/above 2^53-1)
+    /// must be a labeled error with state untouched — before the fix it
+    /// poisoned last_scanned, bricking save→load or producing a state the JS
+    /// SDK rejects. Both SDKs bound heights to [0, 2^53-1] so a state loads
+    /// in both or neither (cross-SDK parity for the 2^53 rejection).
+    #[test]
+    fn scan_block_rejects_invalid_heights_before_mutating() {
+        let seed = [40u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        w.scan_block(&serde_json::json!({
+            "height": 100,
+            "hash": "aa".repeat(32),
+            "tx": [{
+                "txid": "bb".repeat(32),
+                "vin": [{ "coinbase": "00" }],
+                "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": { "hex": spk_hex } }],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 100_000_000);
+        let pay = serde_json::json!([{
+            "txid": "cc".repeat(32),
+            "vin": [{ "txid": "dd".repeat(32), "vout": 0 }],
+            "vout": [{ "n": 0, "value": 2.0, "scriptPubKey": { "hex": spk_hex } }],
+        }]);
+        for height in [
+            serde_json::json!(-1),
+            serde_json::json!(100.5),
+            serde_json::json!(9_007_199_254_740_992i64), // 2^53: JS-unsafe
+            serde_json::Value::Null,                     // missing height
+        ] {
+            let err = w
+                .scan_block(&serde_json::json!({
+                    "height": height, "hash": "ee".repeat(32), "tx": pay,
+                }))
+                .unwrap_err();
+            assert!(err.to_string().contains("height"), "got {err}");
+        }
+        assert_eq!(w.last_scanned_block(), 100, "scan position untouched");
+        assert_eq!(
+            w.balance(),
+            100_000_000,
+            "nothing credited from rejected blocks"
+        );
+        // The state still saves and loads (a poisoned height used to brick it).
+        let r = TransparentWallet::load(&seed, &w.save()).unwrap();
+        assert_eq!(r.last_scanned_block(), 100);
+    }
+
+    /// W2: reset_scan(-1) used to drop every scanned UTXO and set a negative
+    /// scan position that bricked the next load(); now it rejects before
+    /// mutating.
+    #[test]
+    fn reset_scan_rejects_negative_height_before_mutating() {
+        let seed = [41u8; 32];
+        let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        let spk_hex = hex::encode(spk(&p2pkh_address(&a0.public_key, MainNetwork)));
+        w.scan_block(&serde_json::json!({
+            "height": 100,
+            "hash": "aa".repeat(32),
+            "tx": [{
+                "txid": "bb".repeat(32),
+                "vin": [{ "txid": "dd".repeat(32), "vout": 0 }],
+                "vout": [{ "n": 0, "value": 1.0, "scriptPubKey": { "hex": spk_hex } }],
+            }],
+        }))
+        .unwrap();
+        assert_eq!(w.balance(), 100_000_000);
+        let err = w.reset_scan(-1).unwrap_err();
+        assert!(err.to_string().contains("non-negative"), "got {err}");
+        assert_eq!(w.last_scanned_block(), 100, "scan position untouched");
+        assert_eq!(w.balance(), 100_000_000, "scanned UTXOs kept");
+        TransparentWallet::load(&seed, &w.save()).unwrap(); // state still loads
+    }
+
+    // W1: account in the hardened range aliases a lower account; reject it.
+    #[test]
+    fn new_rejects_hardened_range_account() {
+        assert!(TransparentWallet::new(&[1u8; 32], MainNetwork, 0x8000_0000, 2).is_err());
+        assert!(TransparentWallet::new(&[1u8; 32], MainNetwork, 0x7fff_ffff, 2).is_ok());
+    }
+
+    // W-SEED: accept a 32-byte raw seed OR a 64-byte BIP39 seed; reject others.
+    #[test]
+    fn new_accepts_32_or_64_byte_seed() {
+        assert!(TransparentWallet::new(&[1u8; 32], MainNetwork, 0, 2).is_ok());
+        assert!(TransparentWallet::new(&[1u8; 64], MainNetwork, 0, 2).is_ok());
+        assert!(TransparentWallet::new(&[1u8; 16], MainNetwork, 0, 2).is_err());
+        assert!(TransparentWallet::new(&[1u8; 33], MainNetwork, 0, 2).is_err());
+    }
+
+    // W2: load bounds heights to [0, 2^53-1], symmetric with scan_block.
+    #[test]
+    fn load_rejects_out_of_range_heights() {
+        let seed = [1u8; 32];
+        assert!(TransparentWallet::load(&seed, CROSS_SDK_STATE).is_ok());
+        let huge_scan =
+            CROSS_SDK_STATE.replace("\"lastScanned\":7", "\"lastScanned\":9007199254740993");
+        assert!(TransparentWallet::load(&seed, &huge_scan).is_err());
+        let neg_scan = CROSS_SDK_STATE.replace("\"lastScanned\":7", "\"lastScanned\":-1");
+        assert!(TransparentWallet::load(&seed, &neg_scan).is_err());
+        let huge_height = CROSS_SDK_STATE.replace(
+            "\"coinbase\":true,\"height\":7",
+            "\"coinbase\":true,\"height\":9007199254740993",
+        );
+        assert!(TransparentWallet::load(&seed, &huge_height).is_err());
+    }
+
+    // W2 belt: spendable_balance/build_send after a max-height load do not panic.
+    #[test]
+    fn max_height_load_does_not_panic() {
+        let seed = [1u8; 32];
+        let state =
+            CROSS_SDK_STATE.replace("\"lastScanned\":7", "\"lastScanned\":9007199254740991");
+        let mut w = TransparentWallet::load(&seed, &state).unwrap();
+        let _ = w.spendable_balance();
+        let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+        // Just exercising the maturity math; result (Ok/Err) is irrelevant.
+        let _ = w.build_send(&p2pkh_address(&a0.public_key, MainNetwork), 1_000, Some(10));
+    }
+
+    // W4: an EXM output is 35 bytes (26-byte script), not the 34 a flat P2PKH
+    // assumes. At 10 sat/byte the EXM send must pay 10 sats more fee than the
+    // P2PKH send (so 10 sats less change) — before the fix both were identical.
+    #[test]
+    fn est_size_counts_exm_output_at_full_length() {
+        let change_after = |to_exm: bool| -> u64 {
+            let seed = [5u8; 32];
+            let mut w = TransparentWallet::new(&seed, MainNetwork, 0, 5).unwrap();
+            let a0 = derive_key(&seed, MainNetwork, 0, 0, 0).unwrap();
+            let s0 = spk(&p2pkh_address(&a0.public_key, MainNetwork));
+            assert!(w.add_utxo(&"aa".repeat(32), 0, 1_000_000_000, s0));
+            let other = derive_key(&[9u8; 32], MainNetwork, 0, 0, 0).unwrap();
+            let hash = hash160(&other.public_key.serialize());
+            let to = if to_exm {
+                crate::transparent::encode_address(&hash, MainNetwork, AddressKind::Exchange)
+            } else {
+                p2pkh_address(&other.public_key, MainNetwork)
+            };
+            let (hex, _) = w.build_send(&to, 100_000_000, Some(10)).unwrap();
+            let bytes = hex::decode(&hex).unwrap();
+            // The change output is last: [8-byte value][0x19 scriptlen][25 script][4 locktime].
+            let off = bytes.len() - 38;
+            assert_eq!(bytes[off + 8], 0x19, "last output is 25-byte P2PKH change");
+            u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+        };
+        let change_exm = change_after(true);
+        let change_p2pkh = change_after(false);
+        assert_eq!(change_p2pkh - change_exm, 10);
     }
 }

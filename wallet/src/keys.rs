@@ -27,7 +27,10 @@ pub enum GenericAddress {
     Transparent(TransparentAddress),
 }
 
-pub fn decode_generic_address(network: Network, enc_addr: &str) -> Result<GenericAddress, WalletError> {
+pub fn decode_generic_address(
+    network: Network,
+    enc_addr: &str,
+) -> Result<GenericAddress, WalletError> {
     if enc_addr.starts_with(network.hrp_sapling_payment_address()) {
         let to_address = decode_payment_address(network.hrp_sapling_payment_address(), enc_addr)
             .map_err(|_| WalletError::InvalidAddress(enc_addr.into()))?;
@@ -44,10 +47,27 @@ pub fn decode_generic_address(network: Network, enc_addr: &str) -> Result<Generi
     }
 }
 
-/// Derive the ZIP32 extended spending key for `seed` (32 bytes of entropy).
-pub fn spending_key_from_seed(seed: &[u8; 32], network: Network, account_index: u32) -> Result<ExtendedSpendingKey, WalletError> {
-    let account = AccountId::try_from(account_index).map_err(|_| WalletError::InvalidKey("invalid account index".into()))?;
-    Ok(sapling_keys::spending_key(seed, coin_type(network), account))
+/// Derive the ZIP32 extended spending key for `seed`: a 32-byte raw seed OR a
+/// 64-byte BIP39 seed. Only the FIRST 32 bytes feed ZIP32 (matching the
+/// pivx-shield WASM, which truncates), so a 64-byte BIP39 seed and its first
+/// 32 bytes yield the same shield spending key.
+pub fn spending_key_from_seed(
+    seed: &[u8],
+    network: Network,
+    account_index: u32,
+) -> Result<ExtendedSpendingKey, WalletError> {
+    if seed.len() != 32 && seed.len() != 64 {
+        return Err(WalletError::InvalidKey(
+            "seed must be 32 bytes (raw) or 64 bytes (BIP39)".into(),
+        ));
+    }
+    let account = AccountId::try_from(account_index)
+        .map_err(|_| WalletError::InvalidKey("invalid account index".into()))?;
+    Ok(sapling_keys::spending_key(
+        &seed[..32],
+        coin_type(network),
+        account,
+    ))
 }
 
 pub fn decode_extsk(enc_extsk: &str, network: Network) -> Result<ExtendedSpendingKey, WalletError> {
@@ -59,13 +79,25 @@ pub fn encode_extsk(extsk: &ExtendedSpendingKey, network: Network) -> String {
     encoding::encode_extended_spending_key(network.hrp_sapling_extended_spending_key(), extsk)
 }
 
-pub fn decode_extended_full_viewing_key(enc_extfvk: &str, network: Network) -> Result<ExtendedFullViewingKey, WalletError> {
-    encoding::decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), enc_extfvk)
-        .map_err(|_| WalletError::InvalidKey("cannot decode extended full viewing key".into()))
+pub fn decode_extended_full_viewing_key(
+    enc_extfvk: &str,
+    network: Network,
+) -> Result<ExtendedFullViewingKey, WalletError> {
+    encoding::decode_extended_full_viewing_key(
+        network.hrp_sapling_extended_full_viewing_key(),
+        enc_extfvk,
+    )
+    .map_err(|_| WalletError::InvalidKey("cannot decode extended full viewing key".into()))
 }
 
-pub fn encode_extended_full_viewing_key(extfvk: &ExtendedFullViewingKey, network: Network) -> String {
-    encoding::encode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), extfvk)
+pub fn encode_extended_full_viewing_key(
+    extfvk: &ExtendedFullViewingKey,
+    network: Network,
+) -> String {
+    encoding::encode_extended_full_viewing_key(
+        network.hrp_sapling_extended_full_viewing_key(),
+        extfvk,
+    )
 }
 
 #[allow(deprecated)]
@@ -97,5 +129,8 @@ pub fn next_address(
         .to_diversifiable_full_viewing_key()
         .find_address(index)
         .ok_or_else(|| WalletError::InvalidKey("no valid diversifier indices left".into()))?;
-    Ok((encode_payment_address(&address, network), *new_index.as_bytes()))
+    Ok((
+        encode_payment_address(&address, network),
+        *new_index.as_bytes(),
+    ))
 }

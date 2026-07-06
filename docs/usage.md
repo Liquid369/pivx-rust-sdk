@@ -65,6 +65,9 @@ A 403 (an IP/ACL denial a cookie can't fix) is not retried.
 credential store — so hand a clone to each task rather than rebuilding the
 client, and a cookie refresh on any one clone is visible to all.
 
+Credentials go through `Auth` — never in the URL. A URL with embedded
+credentials (`http://user:pass@host`) is rejected at construction.
+
 For multiwallet nodes append `/wallet/<name>` to the URL. There is no TLS:
 run the node on localhost or tunnel the connection; do not expose the RPC
 port.
@@ -240,7 +243,7 @@ let view = client.view_shield_transaction(&txid).await?;  // decrypted amounts +
 
 v0.6 adds ZMQ push notifications: pivxd can push a notification on every new
 block or transaction, so you can trigger a wallet `sync` the moment the chain
-moves instead of polling `ShieldWatcher`. (v0.6.0 ships pivx-rpc 0.5.0.) Launch
+moves instead of polling `ShieldWatcher`. Launch
 the node with the matching endpoints, e.g.
 `-zmqpubhashblock=tcp://127.0.0.1:28332 -zmqpubrawtx=tcp://127.0.0.1:28332`
 (topics: `hashblock`, `hashtx`, `rawblock`, `rawtx`).
@@ -275,6 +278,21 @@ before returning `Err` rather than failing fast; wrap it in
 `hash` (display-order hex); `RawBlock`/`RawTx` carry raw bytes as `block` / `tx`;
 every variant carries a little-endian `sequence`.
 
+Two operational caveats. ZMQ is fire-and-forget: each topic's `sequence`
+increments per published message, so a gap between consecutive events on one
+topic means messages were dropped (SUB sockets drop under backpressure and
+across reconnects) — treat a gap as a cue to do a full RPC re-sync rather
+than assume continuity. And a SUB socket has no liveness signal: a dead or
+restarted node just looks like silence, so wrap `recv()` in
+`tokio::time::timeout` and keep a periodic RPC poll (a `get_block_count` or
+wallet `sync` on a timer) running alongside the subscription as a fallback.
+
+One cross-SDK divergence: on a well-formed frame with an unknown topic (ZMQ
+subscriptions are prefix matches, so a future node can publish new topics
+that match yours), `recv()` returns a `ZmqError::UnknownTopic` error, while
+the JS SDK's iterator silently skips the frame and keeps iterating.
+Subscribe to exact topic names if you share logic between the SDKs.
+
 If you already have a socket, skip the subscriber and decode frames yourself
 with the pure `parse_zmq_frame(topic, body, seq)` — always compiled, no feature
 needed — which returns the same typed `ZmqEvent`.
@@ -289,7 +307,9 @@ the key:
 ```rust
 use pivx_wallet::{Network, ShieldWallet};
 
-// full capability: 32 bytes of entropy, ZIP32 derivation (coin type 119)
+// full capability: ZIP32 derivation (coin type 119). `seed` is a 32-byte raw
+// seed OR a 64-byte BIP39 seed — the 64-byte BIP39 seed reproduces
+// MyPIVXWallet (MPW) / BIP39 seed-phrase wallet addresses (shield uses its first 32 bytes).
 let mut w1 = ShieldWallet::from_seed(&seed, Network::MainNetwork, 4_800_000, 0)?;
 
 // full capability: an exported extended spending key (p-secret-spending-key-...)
@@ -347,10 +367,32 @@ wallet.handle_blocks(&[WalletBlock { height, tx_hexes }])?;
 
 If the tree check fails, `sync` returns `WalletError::ScanDiverged`. This
 means a chain reorg crossed a batch boundary, the node lied, or the saved
-state is corrupt. Recovery is mechanical: recreate the wallet from its keys
-with the same birth height and sync again. The `rpc` feature (on by
-default) provides `sync` and `send`; disable it to bring your own
-transport.
+state is corrupt. Recovery is mechanical: call `reload_from_checkpoint(height)`
+with a height at or below the divergence — it resets scan state to the
+nearest bundled checkpoint and keeps the keys — then sync again:
+
+```rust
+use pivx_wallet::WalletError;
+
+match wallet.sync(&client, 100).await {
+    Err(WalletError::ScanDiverged { height, .. }) => {
+        // Reconcile pending_transactions() first — see the warning below.
+        wallet.reload_from_checkpoint(height)?;
+        wallet.sync(&client, 100).await?;
+    }
+    other => other?,
+}
+```
+
+`reload_from_checkpoint` also drops **pending spends**. Before recovering,
+reconcile any in-flight broadcasts — `pending_transactions()` lists them —
+by waiting for each txid to confirm or clearly disappear. Retrying a spend
+after recovery while the old transaction is still unconfirmed is a
+double-spend risk: the reloaded state no longer knows those notes are
+committed.
+
+The `rpc` feature (on by default) provides `sync` and `send`; disable it to
+bring your own transport.
 
 Rust's borrow rules prevent concurrent syncs on one wallet. Keep it that
 way across tasks: one wallet, one writer. To cancel a long sync, drop its
@@ -438,19 +480,34 @@ runtime's worker threads. To broadcast yourself:
 let tx = wallet.create_transaction(&opts).await?;
 match client.send_raw_transaction(&tx.txhex).await {
     Ok(_) => wallet.finalize_transaction(&tx.txid),
-    // Discard only on a definitive node rejection.
-    Err(e @ pivx_rpc::Error::Rpc { .. }) => {
-        wallet.discard_transaction(&tx.txid);
-        return Err(e.into());
+    Err(err) => {
+        // Discard ONLY on a definitive node rejection. Mirror wallet.send():
+        // some Error::Rpc replies mean the node already HAS this transaction
+        // (or a conflicting one), so it may still confirm — keep those pending.
+        if let pivx_rpc::Error::Rpc { code, message, .. } = &err {
+            let node_may_have_tx = *code == -27 // already in chain
+                || message.contains("txn-already-in-mempool")
+                || message.contains("txn-already-known")
+                || message.contains("txn-mempool-conflict")
+                || message.contains("bad-txns-nullifier-double-spent")
+                || message.contains("bad-txns-shielded-requirements-not-met");
+            if !node_may_have_tx {
+                wallet.discard_transaction(&tx.txid);
+            }
+        }
+        return Err(err.into());
     }
-    Err(e) => return Err(e.into()),
 }
 ```
 
-Discard only on `Error::Rpc` (a definitive node rejection): a transport
-failure is ambiguous — the node may have accepted the transaction — so the
-notes must stay pending until the txid confirms or clearly disappears, or
-a retry could double-spend them.
+Discard only on a definitive `Error::Rpc` rejection — and not even then when
+the reply means the node already has the transaction (`-27` already-in-chain,
+`txn-already-in-mempool`/`-known`/`-conflict`, or the shield-specific
+`bad-txns-nullifier-double-spent` / `bad-txns-shielded-requirements-not-met`):
+those may still confirm, so the notes must stay pending until the txid
+confirms or clearly disappears, or a retry could double-spend them. A
+transport failure is ambiguous for the same reason. `wallet.send()` applies
+exactly this guard for you.
 
 Fee behavior to know before wiring withdrawals: the fee is size-based
 (1000 sats/byte over a fixed model; a typical 1-in-2-out shield spend pays
@@ -521,6 +578,8 @@ coins two ways — scan the chain, or hand it UTXOs you already know about.
 ```rust
 use pivx_wallet::TransparentWallet;
 
+// `seed` is a 32-byte raw seed OR a 64-byte BIP39 seed; the 64-byte BIP39 seed
+// derives the same addresses as MyPIVXWallet (MPW) / BIP39 seed-phrase wallets (BIP32 over the full seed).
 let mut wallet = TransparentWallet::new(&seed, Network::MainNetwork, 0, 100)?;  // account 0, gap 100
 let addr = wallet.new_address()?;               // fresh receive address per deposit
 
@@ -542,6 +601,11 @@ check confirmations or coinbase/coinstake maturity. Feeding UTXOs from your own
 indexer means enforcing confirmation depth and coinbase/coinstake maturity
 yourself; UTXOs found by `scan_block`/`sync` are maturity-tracked (coinbase and
 coinstake outputs stay unspendable until deep enough) and are the safer path.
+
+Coverage is deliberately narrow: only P2PKH and exchange-script (`EXM`)
+outputs are credited. A bare P2PK output or a cold-staking output paying the
+same keys is not seen by `scan_block` or `add_utxo` — and would be unspendable
+by this wallet's transaction builder anyway.
 
 `scan_block` checks parent-hash continuity: when a block claims to extend
 the last scanned one (height exactly one higher) but its
@@ -570,12 +634,24 @@ match wallet.sync(&client, 4_800_000, 100).await {
 let (hex, spent) = wallet.build_send("D...recipient", 150_000_000, Some(100))?;  // 100 sats/byte
 match client.send_raw_transaction(&hex).await {
     Ok(_) => wallet.mark_spent(&spent),          // finalize: inputs dropped for good
-    // Release only on a definitive node rejection.
-    Err(e @ pivx_rpc::Error::Rpc { .. }) => {
-        wallet.release(&spent);
-        return Err(e.into());
+    Err(err) => {
+        // Some Error::Rpc replies mean the node already HAS this transaction
+        // (or a conflicting one spending these inputs), so it may still confirm
+        // — finalize those, and release the reservation only on a genuine
+        // rejection. Mirrors send()'s shield guard.
+        if let pivx_rpc::Error::Rpc { code, message, .. } = &err {
+            let node_has_tx = *code == -27 // already in chain
+                || message.contains("txn-already-in-mempool")
+                || message.contains("txn-already-known")
+                || message.contains("txn-mempool-conflict");
+            if node_has_tx {
+                wallet.mark_spent(&spent);
+            } else {
+                wallet.release(&spent);
+            }
+        }
+        return Err(err.into());
     }
-    Err(e) => return Err(e.into()),
 }
 ```
 
@@ -585,8 +661,10 @@ fresh internal address. It errors if funds can't cover amount + fee rather
 than underpaying. The inputs it selects are reserved: a second `build_send`
 cannot double-spend them before broadcast, and `balance()` excludes them
 (`utxos()` still lists them). `mark_spent(&spent)` finalizes after a
-successful broadcast; `release(&spent)` un-reserves after a definitive node
-rejection (`Error::Rpc`). A transport failure is ambiguous — the node may
+successful broadcast — and also when an `Error::Rpc` means the node already
+has the transaction (`-27` already-in-chain, `txn-already-in-mempool`/`-known`/
+`-conflict`), since it may still confirm; `release(&spent)` un-reserves only on
+a genuine node rejection. A transport failure is ambiguous — the node may
 have accepted the transaction — so keep the reservation until the txid
 confirms or clearly disappears, the same rule as the shield wallet's
 discard. This send path is verified against real mainnet transactions.

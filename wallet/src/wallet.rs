@@ -85,6 +85,20 @@ pub struct AttributedNote {
     pub value: u64,
 }
 
+/// Sapling (UPGRADE_V5_0) activation height, inclusive. Below it consensus
+/// rejects any tx carrying shielded DATA (IsShieldedTx, PIVX transaction.h /
+/// sapling_validation.cpp "bad-txns-invalid-sapling-act") — the version byte
+/// alone is legal — and the node reports a zero finalsaplingroot, so the
+/// sapling root check is skipped there and '03'-prefixed txs are skipped
+/// rather than scanned; at/above it an honest node always reports a real,
+/// matchable root. Mainnet V5_0 is 2_700_500; testnet is 201.
+fn sapling_activation(network: Network) -> i64 {
+    match network {
+        Network::MainNetwork => 2_700_500,
+        Network::TestNetwork => 201,
+    }
+}
+
 /// Standalone PIVX wallet: owns keys, scans blocks, tracks shielded notes,
 /// and builds fully-proved transactions locally. A node is only a chain-data
 /// source and broadcast endpoint.
@@ -108,10 +122,11 @@ pub struct ShieldWallet {
 }
 
 impl ShieldWallet {
-    /// Full-capability wallet from 32 bytes of seed entropy (ZIP32, PIVX
-    /// coin type). Scanning starts at the checkpoint nearest `birth_height`.
+    /// Full-capability wallet from a seed: a 32-byte raw seed OR a 64-byte
+    /// BIP39 seed (ZIP32 over its first 32 bytes, matching the pivx-shield
+    /// WASM). Scanning starts at the checkpoint nearest `birth_height`.
     pub fn from_seed(
-        seed: &[u8; 32],
+        seed: &[u8],
         network: Network,
         birth_height: i64,
         account_index: u32,
@@ -144,6 +159,17 @@ impl ShieldWallet {
             (Some(sk), None) => keys::extfvk_from_extsk(sk),
             (None, None) => unreachable!("constructors always pass a key"),
         };
+        // Reject a birth_height outside [0, i32::MAX] rather than clamping it:
+        // a huge birth_height clamped to i32::MAX would silently start scanning
+        // near the chain tip and MISS every deposit below it, and a negative one
+        // is never valid. The JS SDK's create() rejects the same range. Every
+        // public constructor routes through from_parts, so this one guard covers
+        // from_seed / from_spending_key / from_viewing_key.
+        if !(0..=i32::MAX as i64).contains(&birth_height) {
+            return Err(WalletError::Other(format!(
+                "birth height must be an integer in [0, 2^31-1], got {birth_height}"
+            )));
+        }
         // Resume from the checkpoint's own height, not birth_height: the tree
         // is the committed state AT the checkpoint, so scanning must start at
         // checkpoint_height + 1. Starting higher would leave the tree missing
@@ -258,7 +284,20 @@ impl ShieldWallet {
     /// Use directly with your own block feed, or see [`sync`](Self::sync).
     pub fn handle_blocks(&mut self, blocks: &[WalletBlock]) -> Result<Vec<String>> {
         let mut prev = self.last_processed_block;
+        let activation = sapling_activation(self.network);
         for b in blocks {
+            // Reject a height that couldn't round-trip through save()/load()
+            // (bounded to [0, 2^53-1], symmetric with the JS SDK's
+            // Number.isSafeInteger guard in applyBlocks): otherwise a scan would
+            // advance last_processed_block to a value load() later rejects,
+            // leaving the saved state unloadable. Checked before any state is
+            // touched, so the wallet is left intact on error.
+            if !(0..=(1i64 << 53) - 1).contains(&b.height) {
+                return Err(WalletError::Other(format!(
+                    "block height must be in [0, 2^53-1], got {}",
+                    b.height
+                )));
+            }
             if b.height <= prev {
                 return Err(WalletError::NonAscendingBlocks);
             }
@@ -269,9 +308,25 @@ impl ShieldWallet {
         };
         let last_height = last.height;
 
+        // Below sapling activation, '03'-prefixed txs are SKIPPED rather than
+        // scanned: consensus forbids shielded DATA below activation
+        // (IsShieldedTx = sapling version AND sapling data, PIVX
+        // transaction.h / sapling_validation.cpp), not the version byte
+        // itself, so a bare-v3 empty-sapdata tx is consensus-legal and must
+        // not fail the sync. Bare v3 is excluded from real chains by
+        // serialization history and carries no shield data, so skipping loses
+        // nothing; fabricated sapling data below activation is unverifiable
+        // (the root check is skipped down there) and stays uncredited because
+        // it never reaches the scanner.
         let tx_hexes: Vec<String> = blocks
             .iter()
-            .flat_map(|b| b.tx_hexes.iter().cloned())
+            .flat_map(|b| {
+                let below_activation = b.height < activation;
+                b.tx_hexes
+                    .iter()
+                    .filter(move |h| !(below_activation && h.starts_with("03")))
+                    .cloned()
+            })
             .collect();
         // Clone rather than move the notes out: if the scan fails (bad tx hex
         // from the node, corrupt witness in loaded state), `?` returns before
@@ -366,6 +421,11 @@ impl ShieldWallet {
         }
         let pending: HashSet<String> = self.pending_spends.values().flatten().cloned().collect();
 
+        // Deriving the shield change address advances diversifier_index, but
+        // planning can still fail (e.g. insufficient balance). Roll the index
+        // back on failure so a failed send does not grow the address gap —
+        // the JS SDK likewise only consumes an address on a successful plan.
+        let saved_diversifier_index = self.diversifier_index;
         let (notes, utxos, change_address) = match &opts.inputs {
             Inputs::Shield => {
                 let spendable: Vec<SerializedNote> = self
@@ -383,7 +443,7 @@ impl ShieldWallet {
         };
         let extsk = self.extsk.as_ref().expect("checked above");
 
-        transaction::plan_transaction(TxOptions {
+        let planned = transaction::plan_transaction(TxOptions {
             notes,
             utxos,
             extsk,
@@ -394,7 +454,11 @@ impl ShieldWallet {
             network: self.network,
             memo: opts.memo.clone().unwrap_or_default(),
             subtract_fee_from_amount: opts.subtract_fee_from_amount,
-        })
+        });
+        if planned.is_err() {
+            self.diversifier_index = saved_diversifier_index;
+        }
+        planned
     }
 
     /// Pending-spend bookkeeping once a transaction is built: shield inputs
@@ -487,6 +551,14 @@ impl ShieldWallet {
             other => return Err(WalletError::Other(format!("unknown network {other}"))),
         };
         let extfvk = keys::decode_extended_full_viewing_key(&state.extfvk, network)?;
+        // Bound the sync position to [0, 2^53-1], symmetric with the scan-height
+        // bounds and the JS SDK (a state loads in both or neither), so downstream
+        // block-height math can't underflow/overflow on a tampered state.
+        if !(0..=(1i64 << 53) - 1).contains(&state.last_processed_block) {
+            return Err(WalletError::Other(
+                "wallet state last-processed block must be in [0, 2^53-1]".into(),
+            ));
+        }
         Ok(Self {
             network,
             extsk: None,
@@ -507,7 +579,17 @@ impl ShieldWallet {
     /// Reset scan state to the checkpoint at or below `height` and drop all
     /// tracked notes. This is the recovery path after a divergence error:
     /// call it, then re-sync. It needs no keys.
-    pub fn reload_from_checkpoint(&mut self, height: i64) {
+    ///
+    /// Rejects a `height` outside `[0, i32::MAX]` — the same guard the
+    /// constructors apply to `birth_height` — rather than clamping: a clamped
+    /// height would silently reset to a valid-but-wrong checkpoint instead of
+    /// surfacing the bad input.
+    pub fn reload_from_checkpoint(&mut self, height: i64) -> Result<()> {
+        if !(0..=i32::MAX as i64).contains(&height) {
+            return Err(WalletError::Other(format!(
+                "checkpoint height must be an integer in [0, 2^31-1], got {height}"
+            )));
+        }
         let (cp_height, cp_tree) = get_checkpoint(height as i32, self.network);
         self.commitment_tree = cp_tree.to_string();
         self.last_processed_block = cp_height as i64;
@@ -515,6 +597,7 @@ impl ShieldWallet {
         self.nullifier_map.clear();
         self.pending_spends.clear();
         self.start_validated = false;
+        Ok(())
     }
 }
 
@@ -536,18 +619,6 @@ impl ShieldWallet {
 mod rpc_sync {
     use super::*;
     use pivx_rpc::PivxClient;
-
-    /// Threshold at/above which the sapling root check runs; below it we skip.
-    /// These are the exact UPGRADE_V5_0 activation heights (inclusive) from PIVX
-    /// consensus, so at/above them an honest node always reports a real,
-    /// matchable finalsaplingroot, and below them (no shielded txs yet) there is
-    /// nothing to verify. Mainnet V5_0 is 2_700_500; testnet is 201.
-    fn sapling_activation(network: Network) -> i64 {
-        match network {
-            Network::MainNetwork => 2_700_500,
-            Network::TestNetwork => 201,
-        }
-    }
 
     /// The node's `finalsaplingroot` at height `h`, or None below activation.
     /// Above activation an omitted root is an error, not "no root" — otherwise
@@ -798,11 +869,34 @@ mod rpc_sync {
                 Err(err) => {
                     // Only release the notes when the node definitively
                     // rejected the transaction. On a transport error the node
-                    // may have accepted it, so keep the spend pending —
-                    // discarding could let a retry double-spend or an operator
-                    // double-pay. Recover per docs/deployment.md.
-                    if matches!(err, pivx_rpc::Error::Rpc { .. }) {
-                        self.discard_transaction(&tx.txid);
+                    // may have accepted it, and some RPC "errors" mean the
+                    // node already HAS the transaction (or a conflicting one):
+                    // -27 = already in chain (PIVX rpc/protocol.h), the
+                    // reject reasons txn-already-in-mempool / txn-already-known
+                    // / txn-mempool-conflict, and the shield-specific
+                    // bad-txns-nullifier-double-spent (a mempool tx already
+                    // spends a nullifier of ours — possibly this very tx,
+                    // rebroadcast or raced) and
+                    // bad-txns-shielded-requirements-not-met
+                    // (HaveShieldedRequirements: an anchor/nullifier already
+                    // spent on-chain) — all PIVX validation.cpp. The -27
+                    // already-in-chain probe scans vout only
+                    // (rawtransaction.cpp), so it can never fire for a z→z
+                    // spend; the shield-specific reasons fire instead. Keep
+                    // those pending too — discarding could let a retry
+                    // double-spend or an operator double-pay; the txid stays
+                    // visible in pending_transactions(). Recover per
+                    // docs/deployment.md.
+                    if let pivx_rpc::Error::Rpc { code, message, .. } = &err {
+                        let node_may_have_tx = *code == -27
+                            || message.contains("txn-already-in-mempool")
+                            || message.contains("txn-already-known")
+                            || message.contains("txn-mempool-conflict")
+                            || message.contains("bad-txns-nullifier-double-spent")
+                            || message.contains("bad-txns-shielded-requirements-not-met");
+                        if !node_may_have_tx {
+                            self.discard_transaction(&tx.txid);
+                        }
                     }
                     Err(err.into())
                 }

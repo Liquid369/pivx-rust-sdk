@@ -31,7 +31,8 @@ use pivx_wallet::{Network, SendOptions, ShieldWallet};
 // Watch-only from a viewing key (exchanges: keys never touch this host)…
 let mut watcher = ShieldWallet::from_viewing_key("p-view…", Network::MainNetwork, 4_800_000)?;
 
-// …or full capability from a seed / spending key.
+// …or full capability from a seed / spending key. The seed is a 32-byte raw
+// seed or a 64-byte BIP39 seed (reproduces MyPIVXWallet (MPW) / BIP39 seed-phrase wallet addresses).
 let mut wallet = ShieldWallet::from_seed(&[0u8; 32], Network::MainNetwork, 4_800_000, 0)?;
 
 let client = pivx_rpc::PivxClient::new("http://127.0.0.1:51473", pivx_rpc::Auth::None)?;

@@ -69,13 +69,16 @@ PoS/header validation, a node that lies self-consistently is believed.
 
 - **Fees are not silently taken from the recipient**, on either the shield
   or the transparent-input path. A send whose inputs cover the amount but not
-  amount + fee returns an error unless you opt into sweep semantics (`sweep`
-  in JS, `subtract_fee_from_amount` in Rust). For exact payouts, leave fee
+  amount + fee returns an error unless you opt into sweep semantics
+  (`subtractFeeFromAmount` in JS — the deprecated `sweep` alias still works —
+  or `subtract_fee_from_amount` in Rust). For exact payouts, leave fee
   headroom (a typical shield spend costs ~0.024 PIV).
-- **Dust notes are dropped, not tracked.** A note worth no more than its own
-  input fee is never retained or spent, so an attacker cannot freeze
-  withdrawals or bloat wallet state by flooding a deposit address with dust.
-  Such notes are economically unspendable and are excluded from the balance.
+- **Dust notes are purged on scan, not spent.** A note worth no more than its
+  own input fee is never selected for spending, and each scan pass drops such
+  notes from tracked state, so an attacker cannot freeze withdrawals or bloat
+  wallet state by flooding a deposit address with dust. One caveat: sub-dust
+  notes carried in an older saved state still count toward the balance until
+  the next scan purges them.
 - **Pending spends are only as durable as your last save.** Notes and
   transparent UTXOs committed to a broadcast-but-unconfirmed transaction are
   held pending and survive `save()`/`load()`, so restarting cannot resurrect a
@@ -111,6 +114,13 @@ If sync reports a sapling-root divergence (`ScanDivergedError` in JS,
 node lied, or saved state is corrupt — call `reloadFromCheckpoint(height)`
 (JS) / `reload_from_checkpoint(height)` (Rust) and re-sync. This resets scan
 state to a checkpoint and rescans; it needs no keys.
+
+Recovery drops **pending spends** along with the tracked notes. Reconcile
+in-flight broadcasts first — `pendingTransactions()` (JS) /
+`pending_transactions()` (Rust) lists them — and wait for each txid to
+confirm or clearly disappear before recovering. Retrying a spend after
+recovery while the old transaction is still unconfirmed is a double-spend
+risk: the reloaded state no longer knows those notes are committed.
 
 On each sync the transparent wallet revalidates its last-scanned block hash and
 self-heals on a same-height tip reorg by re-scanning a window, whereas the

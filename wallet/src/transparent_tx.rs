@@ -118,7 +118,16 @@ fn serialize(
         out.extend_from_slice(&txid);
         out.extend_from_slice(&input.vout.to_le_bytes());
         write_script(&mut out, &script_sigs[i]);
-        out.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // nSequence
+        // nSequence: 0xffffffff marks the tx final, which makes the node
+        // IGNORE nLockTime (IsFinalTx, src/consensus/tx_verify.cpp). A
+        // non-zero locktime therefore needs a non-final sequence; 0xfffffffe
+        // keeps the locktime enforceable without opting in to replacement.
+        let sequence: u32 = if locktime != 0 {
+            0xffff_fffe
+        } else {
+            0xffff_ffff
+        };
+        out.extend_from_slice(&sequence.to_le_bytes());
     }
     write_varint(&mut out, outputs.len() as u64);
     for (script, value) in outputs {
@@ -172,12 +181,19 @@ pub fn build_transparent_tx(
         script_sigs[i] = script_sig;
     }
 
-    Ok(hex::encode(serialize(
-        inputs,
-        &script_sigs,
-        &out_scripts,
-        locktime,
-    )?))
+    let raw = serialize(inputs, &script_sigs, &out_scripts, locktime)?;
+    // PIVX policy rejects any tx AT or above MAX_STANDARD_TX_SIZE (`sz >=
+    // 100000`, src/policy/policy.cpp IsStandardTx), so never return one.
+    // Callers estimate sizes before selecting inputs; this re-checks the
+    // ACTUAL serialized size as insurance against estimator drift, and runs
+    // before the wallet's build_send reserves anything (it reserves only
+    // after this returns).
+    if raw.len() >= 100_000 {
+        return Err(WalletError::Other(
+            "transaction would exceed the 100kB standard size (too many small inputs); consolidate UTXOs first".into(),
+        ));
+    }
+    Ok(hex::encode(raw))
 }
 
 #[cfg(test)]
@@ -229,5 +245,75 @@ mod tests {
         assert!(tx.starts_with("01000000")); // nVersion=1, nType=0
         assert!(tx.ends_with("00000000")); // nLockTime = 0
         assert!(!tx.is_empty());
+    }
+
+    /// nSequence of a single-input tx, parsed from the raw hex: 4 bytes
+    /// version+type, 1 varint vin count, 32 txid, 4 vout, 1 varint scriptSig
+    /// length, scriptSig, then the 4 sequence bytes.
+    fn first_input_sequence(tx: &str) -> String {
+        let script_len = usize::from_str_radix(&tx[82..84], 16).unwrap();
+        tx[84 + script_len * 2..84 + script_len * 2 + 8].to_string()
+    }
+
+    /// C11: a non-zero locktime needs a non-final nSequence (0xfffffffe) or
+    /// the node ignores nLockTime entirely (IsFinalTx).
+    #[test]
+    fn locktime_sets_nonfinal_sequence() {
+        let k = derive_key(&[2u8; 32], MainNetwork, 0, 0, 0).unwrap();
+        let dest = derive_key(&[3u8; 32], MainNetwork, 0, 0, 0).unwrap();
+        let build = |locktime: u32| {
+            build_transparent_tx(
+                &[TxInput {
+                    txid: "ab".repeat(32),
+                    vout: 0,
+                    amount: 100_000_000,
+                    script_pubkey: script_pubkey_for_address(&k.address()).unwrap(),
+                    secret_key: k.secret_key,
+                }],
+                &[TxOutput {
+                    address: dest.address(),
+                    amount: 99_000_000,
+                }],
+                locktime,
+            )
+            .unwrap()
+        };
+        let with_lock = build(500_000);
+        assert!(with_lock.ends_with("20a10700")); // nLockTime = 500000 LE
+        assert_eq!(first_input_sequence(&with_lock), "feffffff"); // non-final
+        let without = build(0);
+        assert!(without.ends_with("00000000"));
+        assert_eq!(first_input_sequence(&without), "ffffffff"); // final
+    }
+
+    /// W1 belt: PIVX policy rejects any tx at or above MAX_STANDARD_TX_SIZE
+    /// (`sz >= 100000`, src/policy/policy.cpp IsStandardTx), so the builder
+    /// refuses to return one — insurance against wallet-estimator drift,
+    /// enforced before build_send reserves anything. 700 P2PKH inputs
+    /// serialize past 100kB for ANY signature sizes (even minimal 145-byte
+    /// inputs give ~101.5kB).
+    #[test]
+    fn refuses_tx_at_or_above_100kb() {
+        let k = derive_key(&[4u8; 32], MainNetwork, 0, 0, 0).unwrap();
+        let spk = script_pubkey_for_address(&k.address()).unwrap();
+        let inputs: Vec<TxInput> = (0..700)
+            .map(|i| TxInput {
+                txid: format!("{i:064x}"),
+                vout: 0,
+                amount: 150_000,
+                script_pubkey: spk.clone(),
+                secret_key: k.secret_key,
+            })
+            .collect();
+        let err = build_transparent_tx(
+            &inputs,
+            &[TxOutput {
+                address: k.address(),
+                amount: 1_000_000,
+            }],
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("100kB standard size"), "got {err}");
     }
 }

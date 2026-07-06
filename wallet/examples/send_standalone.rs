@@ -8,7 +8,9 @@ use pivx_wallet::{Network, SendOptions, ShieldWallet};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let spending_key = args.next().expect("usage: send_standalone <spending-key> <birth-height> <to> <piv>");
+    let spending_key = args
+        .next()
+        .expect("usage: send_standalone <spending-key> <birth-height> <to> <piv>");
     let birth_height: i64 = args.next().expect("missing birth height").parse()?;
     let to = args.next().expect("missing recipient");
     let piv: f64 = args.next().expect("missing amount").parse()?;
@@ -21,7 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let mut wallet = ShieldWallet::from_spending_key(&spending_key, Network::MainNetwork, birth_height)?;
+    let mut wallet =
+        ShieldWallet::from_spending_key(&spending_key, Network::MainNetwork, birth_height)?;
     wallet.sync(&client, 100).await?;
     println!("balance: {} PIV", wallet.balance() as f64 / 1e8);
 
@@ -29,10 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pivx_wallet::load_prover().await?;
 
     let txid = wallet
-        .send(&client, &SendOptions {
-            memo: Some("standalone pivx-wallet send".into()),
-            ..SendOptions::shield(to, (piv * 1e8).round() as u64)
-        })
+        .send(
+            &client,
+            &SendOptions {
+                memo: Some("standalone pivx-wallet send".into()),
+                ..SendOptions::shield(to, (piv * 1e8).round() as u64)
+            },
+        )
         .await?;
     println!("sent: {txid}");
     Ok(())

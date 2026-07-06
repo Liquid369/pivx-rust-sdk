@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::types::*;
 
 /// Authentication for the node's RPC interface.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Auth {
     None,
     UserPass {
@@ -17,6 +17,21 @@ pub enum Auth {
     },
     /// Read `user:pass` from a pivxd `.cookie` file (regenerated each start).
     CookieFile(PathBuf),
+}
+
+// Manual Debug: the RPC password must never leak into logs/panic messages.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::None => f.write_str("None"),
+            Auth::UserPass { user, pass: _ } => f
+                .debug_struct("UserPass")
+                .field("user", user)
+                .field("pass", &"<redacted>")
+                .finish(),
+            Auth::CookieFile(path) => f.debug_tuple("CookieFile").field(path).finish(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +66,10 @@ pub enum Error {
     Cookie(#[from] std::io::Error),
     #[error("{0}")]
     InvalidCookie(String),
+    /// The node URL embedded `user:pass@` credentials, which this client does
+    /// not support (they would end up in logs and error messages).
+    #[error("credentials in the URL are not supported; pass them via Auth::UserPass or Auth::CookieFile")]
+    CredentialsInUrl,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -110,6 +129,9 @@ pub struct PivxClient {
     /// Set only for [`Auth::CookieFile`]: where to re-read credentials from.
     cookie_path: Option<PathBuf>,
     max_response_size: usize,
+    /// The client-wide per-request timeout (also set on the reqwest client);
+    /// kept here so long-running calls can raise it per request.
+    timeout: std::time::Duration,
     id: std::sync::Arc<AtomicU64>,
 }
 
@@ -117,6 +139,10 @@ impl PivxClient {
     /// `url` e.g. `"http://127.0.0.1:51473"`. For multiwallet nodes append
     /// `/wallet/<name>` to route calls to a specific wallet. Uses a 30-second
     /// per-request timeout; see [`with_timeout`](Self::with_timeout) to change it.
+    ///
+    /// Credentials embedded in the URL (`http://user:pass@host`) are not
+    /// supported and are rejected with [`Error::CredentialsInUrl`] — pass
+    /// them via [`Auth`] instead.
     pub fn new(url: impl Into<String>, auth: Auth) -> Result<Self> {
         Self::with_timeout(url, auth, std::time::Duration::from_secs(30))
     }
@@ -129,6 +155,14 @@ impl PivxClient {
         auth: Auth,
         timeout: std::time::Duration,
     ) -> Result<Self> {
+        let url = url.into();
+        // Reject URL userinfo up front: it is not sent as basic auth by this
+        // client, and a URL with a password in it leaks into logs/errors.
+        if let Ok(parsed) = reqwest::Url::parse(&url) {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(Error::CredentialsInUrl);
+            }
+        }
         let (auth, cookie_path) = match auth {
             Auth::None => (None, None),
             Auth::UserPass { user, pass } => (Some((user, pass)), None),
@@ -136,10 +170,11 @@ impl PivxClient {
         };
         Ok(Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
-            url: url.into(),
+            url,
             auth: std::sync::Arc::new(std::sync::RwLock::new(auth)),
             cookie_path,
             max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
+            timeout,
             id: std::sync::Arc::new(AtomicU64::new(0)),
         })
     }
@@ -152,11 +187,19 @@ impl PivxClient {
         self
     }
 
-    /// POST `payload` with the current credentials.
-    async fn post(&self, payload: &Value) -> Result<reqwest::Response> {
+    /// POST `payload` with the current credentials. A `timeout` overrides the
+    /// client-wide request timeout for this request only.
+    async fn post(
+        &self,
+        payload: &Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
         let req = {
             let auth = self.auth.read().unwrap();
             let mut req = self.http.post(&self.url).json(payload);
+            if let Some(t) = timeout {
+                req = req.timeout(t);
+            }
             if let Some((user, pass)) = auth.as_ref() {
                 req = req.basic_auth(user, Some(pass));
             }
@@ -207,15 +250,20 @@ impl PivxClient {
     /// handling, and response cap. Returns the parsed JSON body and the HTTP
     /// status. Shared by [`call`](Self::call) (single request) and
     /// [`call_batch`](Self::call_batch) (request array).
-    async fn send_rpc(&self, payload: &Value, method: &str) -> Result<(Value, u16)> {
-        let mut resp = self.post(payload).await?;
+    async fn send_rpc(
+        &self,
+        payload: &Value,
+        method: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(Value, u16)> {
+        let mut resp = self.post(payload, timeout).await?;
         // pivxd regenerates `.cookie` on every restart: on 401, re-read it and
         // retry once if the credentials actually changed. A 403 is an IP/ACL
         // denial that a cookie can't fix, so it is not retried. An unreadable
         // cookie counts as unchanged and falls through to Error::Auth (the
         // caller's actionable signal is that authentication failed).
         if resp.status().as_u16() == 401 && self.refresh_cookie().unwrap_or(false) {
-            resp = self.post(payload).await?;
+            resp = self.post(payload, timeout).await?;
         }
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
@@ -246,21 +294,29 @@ impl PivxClient {
 
     /// Raw JSON-RPC call. Trailing `Value::Null` params are trimmed so
     /// optional arguments fall back to node defaults.
-    pub async fn call<T: DeserializeOwned>(
+    pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Vec<Value>) -> Result<T> {
+        self.call_with_timeout(None, method, params).await
+    }
+
+    /// [`call`](Self::call) with an optional per-request timeout override
+    /// (used by long-running calls like a sapling-key import with rescan).
+    async fn call_with_timeout<T: DeserializeOwned>(
         &self,
+        timeout: Option<std::time::Duration>,
         method: &str,
         mut params: Vec<Value>,
     ) -> Result<T> {
         while params.last() == Some(&Value::Null) {
             params.pop();
         }
+        let id = self.id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "jsonrpc": "1.0",
-            "id": self.id.fetch_add(1, Ordering::Relaxed),
+            "id": id,
             "method": method,
             "params": params,
         });
-        let (body, status) = self.send_rpc(&payload, method).await?;
+        let (body, status) = self.send_rpc(&payload, method, timeout).await?;
         if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
             return Err(rpc_error(err, method));
         }
@@ -268,6 +324,18 @@ impl PivxClient {
             return Err(Error::Http {
                 status,
                 method: method.to_string(),
+            });
+        }
+        // Belt-and-braces: a success response must echo our request id — a
+        // mismatch means the reply is not for this request (broken proxy or
+        // desynced pipeline), so reject rather than mis-attribute the result.
+        if body.get("id").and_then(Value::as_u64) != Some(id) {
+            return Err(Error::Json {
+                method: method.to_string(),
+                source: <serde_json::Error as serde::de::Error>::custom(format!(
+                    "response id {} does not match request id {id}",
+                    body.get("id").cloned().unwrap_or(Value::Null)
+                )),
             });
         }
         serde_json::from_value(body.get("result").cloned().unwrap_or(Value::Null)).map_err(
@@ -284,9 +352,12 @@ impl PivxClient {
     /// does not fail the batch; the outer `Err` is reserved for
     /// transport/auth/whole-request failures. Rejects an empty `calls` slice.
     ///
-    /// Design: each sub-request gets a distinct id, but responses are matched
-    /// to requests **by position** — the node returns the array in request
-    /// order (src/httprpc.cpp) — guarded by an element-count check.
+    /// Design: each sub-request gets a distinct id, and responses are matched
+    /// to requests **by id** — pivxd returns the array in request order
+    /// (src/httprpc.cpp), but a broken proxy or desynced pipeline could
+    /// reorder or mislabel, so the results are re-attributed by id rather than
+    /// position. A non-object element, or a missing/mismatched id, fails the
+    /// whole batch with a labeled error instead of mis-attributing a result.
     pub async fn call_batch(
         &self,
         calls: &[(&str, Vec<Value>)],
@@ -298,20 +369,25 @@ impl PivxClient {
                 method: "batch".to_string(),
             });
         }
+        // Capture each sub-request's id so responses can be matched by id.
+        let ids: Vec<u64> = (0..calls.len())
+            .map(|_| self.id.fetch_add(1, Ordering::Relaxed))
+            .collect();
         let payload = Value::Array(
             calls
                 .iter()
-                .map(|(method, params)| {
+                .zip(&ids)
+                .map(|((method, params), id)| {
                     json!({
                         "jsonrpc": "1.0",
-                        "id": self.id.fetch_add(1, Ordering::Relaxed),
+                        "id": *id,
                         "method": method,
                         "params": params,
                     })
                 })
                 .collect(),
         );
-        let (body, status) = self.send_rpc(&payload, "batch").await?;
+        let (body, status) = self.send_rpc(&payload, "batch", None).await?;
         // A whole-request failure (e.g. a malformed batch) comes back as a
         // single error object, not an array — surface it as the outer Err.
         if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
@@ -344,17 +420,50 @@ impl PivxClient {
                 )),
             });
         }
-        Ok(arr
-            .into_iter()
-            .zip(calls.iter())
-            .map(|(elem, (method, _))| {
-                if let Some(err) = elem.get("error").filter(|e| !e.is_null()) {
-                    Err(rpc_error(err, method))
-                } else {
-                    Ok(elem.get("result").cloned().unwrap_or(Value::Null))
+        // Index the elements by id. A non-object element (which pivxd never
+        // sends but a hostile endpoint might) or one lacking an integer id is
+        // rejected rather than silently turned into Ok(Null).
+        let mut by_id: HashMap<u64, Value> = HashMap::with_capacity(arr.len());
+        for elem in arr {
+            if !elem.is_object() {
+                return Err(Error::Json {
+                    method: "batch".to_string(),
+                    source: <serde_json::Error as serde::de::Error>::custom(
+                        "batch response element was not a JSON object",
+                    ),
+                });
+            }
+            match elem.get("id").and_then(Value::as_u64) {
+                Some(id) => {
+                    by_id.insert(id, elem);
                 }
-            })
-            .collect())
+                None => {
+                    return Err(Error::Json {
+                        method: "batch".to_string(),
+                        source: <serde_json::Error as serde::de::Error>::custom(
+                            "batch response element has no integer id",
+                        ),
+                    })
+                }
+            }
+        }
+        // Reassemble in request order, pulling each element by its request id.
+        // A missing id means the reply cannot be attributed to this request.
+        let mut out = Vec::with_capacity(calls.len());
+        for (id, (method, _)) in ids.into_iter().zip(calls.iter()) {
+            let elem = by_id.remove(&id).ok_or_else(|| Error::Json {
+                method: "batch".to_string(),
+                source: <serde_json::Error as serde::de::Error>::custom(format!(
+                    "batch response has no element with id {id} (method {method})"
+                )),
+            })?;
+            if let Some(err) = elem.get("error").filter(|e| !e.is_null()) {
+                out.push(Err(rpc_error(err, method)));
+            } else {
+                out.push(Ok(elem.get("result").cloned().unwrap_or(Value::Null)));
+            }
+        }
+        Ok(out)
     }
 
     // ── Blockchain ───────────────────────────────────────────────────────
@@ -489,8 +598,22 @@ impl PivxClient {
         self.call("getnewaddress", vec![json!(label)]).await
     }
 
-    pub async fn list_unspent(&self, min_conf: i64) -> Result<Vec<Unspent>> {
-        self.call("listunspent", vec![json!(min_conf)]).await
+    /// Unspent transparent outputs. `max_conf` bounds the confirmation range
+    /// (node default `9999999`) and `addresses` filters to specific addresses
+    /// (`None` = all wallet addresses). Args are positional, matching pivxd's
+    /// `listunspent minconf maxconf addresses` (src/wallet/rpcwallet.cpp).
+    pub async fn list_unspent(
+        &self,
+        min_conf: i64,
+        max_conf: i64,
+        addresses: Option<&[String]>,
+    ) -> Result<Vec<Unspent>> {
+        // addresses=None trims to a trailing null so the node applies its default.
+        self.call(
+            "listunspent",
+            vec![json!(min_conf), json!(max_conf), json!(addresses)],
+        )
+        .await
     }
 
     pub async fn send_to_address(&self, address: &str, amount: f64) -> Result<String> {
@@ -499,8 +622,18 @@ impl PivxClient {
     }
 
     /// Wallet's record of a transaction (amounts, confirmations, fee, details).
-    pub async fn get_transaction(&self, txid: &str) -> Result<Transaction> {
-        self.call("gettransaction", vec![json!(txid)]).await
+    /// `include_watch_only` includes details for watch-only addresses (pivxd
+    /// `gettransaction txid include_watchonly`, src/wallet/rpcwallet.cpp).
+    pub async fn get_transaction(
+        &self,
+        txid: &str,
+        include_watch_only: bool,
+    ) -> Result<Transaction> {
+        self.call(
+            "gettransaction",
+            vec![json!(txid), json!(include_watch_only)],
+        )
+        .await
     }
 
     /// Validate an address; `isvalid` says whether it is, and the remaining
@@ -700,15 +833,28 @@ impl PivxClient {
         .await
     }
 
-    /// Build and prove a shielded transaction but do not broadcast; returns raw hex.
+    /// Build and prove a shielded transaction but do not broadcast; returns
+    /// raw hex. Omitted `min_conf`/`fee` use the node defaults (1 / computed
+    /// fee), the same substitution as
+    /// [`shield_send_many_with`](Self::shield_send_many_with) and the JS SDK's
+    /// `rawShieldSendMany`.
     pub async fn raw_shield_send_many(
         &self,
         from: impl Into<FromAddress>,
         recipients: &[ShieldRecipient],
+        min_conf: Option<i64>,
+        fee: Option<f64>,
     ) -> Result<String> {
         self.call(
             "rawshieldsendmany",
-            vec![json!(from.into().as_str()), json!(recipients)],
+            vec![
+                json!(from.into().as_str()),
+                json!(recipients),
+                json!(min_conf.unwrap_or(1)),
+                // fee=0 = "node computes the minimum fee" (rpcwallet.cpp: "If
+                // nFee=0 leave the default"); a null would be rejected.
+                json!(fee.unwrap_or(0.0)),
+            ],
         )
         .await
     }
@@ -732,6 +878,10 @@ impl PivxClient {
 
     /// Import a sapling spending key. `rescan`: `"yes"` | `"no"` |
     /// `"whenkeyisnew"` (default). `height` rescans from that block.
+    ///
+    /// Unless `rescan` is `Some("no")`, this request's timeout is raised to
+    /// at least 10 minutes — a wallet rescan blocks the node well past the
+    /// default 30s (same contract as the JS SDK).
     pub async fn import_sapling_key(
         &self,
         key: &str,
@@ -748,7 +898,8 @@ impl PivxClient {
         if let Some(h) = height {
             params.push(json!(h));
         }
-        self.call("importsaplingkey", params).await
+        self.call_with_timeout(self.rescan_timeout(rescan), "importsaplingkey", params)
+            .await
     }
 
     pub async fn export_sapling_viewing_key(&self, shield_addr: &str) -> Result<String> {
@@ -758,6 +909,10 @@ impl PivxClient {
 
     /// Import an incoming viewing key for watch-only shield balance
     /// tracking. `rescan`: `"yes"` | `"no"` | `"whenkeyisnew"` (default).
+    ///
+    /// Same long-rescan timeout as [`import_sapling_key`](Self::import_sapling_key):
+    /// unless `rescan` is `Some("no")`, the request timeout is raised to at
+    /// least 10 minutes.
     pub async fn import_sapling_viewing_key(
         &self,
         vkey: &str,
@@ -774,13 +929,43 @@ impl PivxClient {
         if let Some(h) = height {
             params.push(json!(h));
         }
-        self.call("importsaplingviewingkey", params).await
+        self.call_with_timeout(
+            self.rescan_timeout(rescan),
+            "importsaplingviewingkey",
+            params,
+        )
+        .await
+    }
+
+    /// Per-request timeout for the sapling import calls: a rescan (any value
+    /// but `"no"`) blocks the node for minutes, so raise the timeout to
+    /// `max(client timeout, 600s)`; `rescan == Some("no")` keeps the
+    /// client-wide timeout.
+    fn rescan_timeout(&self, rescan: Option<&str>) -> Option<std::time::Duration> {
+        (rescan != Some("no")).then(|| self.timeout.max(std::time::Duration::from_secs(600)))
     }
 
     // ── Masternode ───────────────────────────────────────────────────────
 
-    pub async fn get_masternode_count(&self) -> Result<i64> {
-        self.call("getmasternodecount", vec![]).await
+    /// Masternode counts by status and network type.
+    ///
+    /// Until the node has a chain tip (fresh start / still syncing headers)
+    /// pivxd returns the bare string `"unknown"` instead of the object; that
+    /// is surfaced as a labeled [`Error::Rpc`] ("node has no chain tip yet"),
+    /// the same contract as the JS SDK.
+    pub async fn get_masternode_count(&self) -> Result<MasternodeCount> {
+        let v: Value = self.call("getmasternodecount", vec![]).await?;
+        if v.as_str() == Some("unknown") {
+            return Err(Error::Rpc {
+                code: 0,
+                message: "node has no chain tip yet".to_string(),
+                method: "getmasternodecount".to_string(),
+            });
+        }
+        serde_json::from_value(v).map_err(|source| Error::Json {
+            method: "getmasternodecount".to_string(),
+            source,
+        })
     }
 
     /// Legacy masternode list; `filter` matches address/txhash/status/etc.

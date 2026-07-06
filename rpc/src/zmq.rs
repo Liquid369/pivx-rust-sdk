@@ -11,6 +11,19 @@
 //! [`parse_zmq_frame`] is pure and always compiled — bring your own socket.
 //! [`ZmqSubscriber`] is a SUB-socket convenience behind the `zmq` cargo
 //! feature (pure-Rust `zeromq` crate, no libzmq).
+//!
+//! # Liveness and dropped messages
+//!
+//! A SUB socket has **no liveness signal**: a stopped node, a dropped TCP
+//! connection, or a quiet chain all look identical — `recv` just pends.
+//! Production pattern: wrap each `recv` in `tokio::time::timeout` and, when
+//! it fires, re-sync via RPC (e.g. `get_best_block_hash`) instead of trusting
+//! the silent socket.
+//!
+//! The `sequence` field is a **per-topic** counter. A gap between consecutive
+//! events of the same topic means messages were dropped (publisher queue
+//! overflow or a reconnect) — treat a gap as a signal to re-sync via RPC, not
+//! as something that will be retransmitted.
 
 /// Topic strings published by pivxd, one per event kind.
 pub const TOPIC_HASHBLOCK: &str = "hashblock";
@@ -19,6 +32,9 @@ pub const TOPIC_RAWBLOCK: &str = "rawblock";
 pub const TOPIC_RAWTX: &str = "rawtx";
 
 /// A decoded ZMQ notification.
+///
+/// `sequence` counts per topic: a gap between consecutive events of the same
+/// topic means dropped messages (see the module docs) — re-sync via RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZmqEvent {
     /// New block; `hash` is the display-order block hash (hex).
@@ -135,6 +151,11 @@ impl ZmqSubscriber {
     }
 
     /// Await the next notification and decode it via [`parse_zmq_frame`].
+    ///
+    /// This can pend forever: a SUB socket carries no liveness signal, so a
+    /// dead node and a quiet chain look identical. Wrap the call in
+    /// `tokio::time::timeout` and re-sync via RPC when it fires (see the
+    /// module docs).
     pub async fn recv(&mut self) -> Result<ZmqEvent, ZmqError> {
         use zeromq::SocketRecv;
         let msg = self

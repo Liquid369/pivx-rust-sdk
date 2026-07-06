@@ -19,14 +19,27 @@ pub enum ShieldEvent {
 }
 
 /// Options for [`ShieldWatcher`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WatchOptions {
-    /// Only consider notes with at least this many confirmations (0 → node default of 1).
+    /// Only consider notes with at least this many confirmations.
+    /// Default `1`, matching the JS SDK default. An explicit `0` passes
+    /// through to the node and includes unconfirmed (mempool) notes.
     pub min_conf: i64,
     /// Restrict watching to these shield addresses. Empty = all wallet addresses.
     pub addresses: Vec<String>,
-    /// Exclude watch-only (viewing key) addresses. Default includes them — that's the point.
-    pub exclude_watch_only: bool,
+    /// Include watch-only (viewing key) addresses. Default `true`, matching the
+    /// JS SDK's `includeWatchOnly` — that's the point of watching a viewing key.
+    pub include_watch_only: bool,
+}
+
+impl Default for WatchOptions {
+    fn default() -> Self {
+        Self {
+            min_conf: 1,
+            addresses: Vec::new(),
+            include_watch_only: true,
+        }
+    }
 }
 
 /// PIV → integer sats, so balance change detection is immune to f64
@@ -53,8 +66,13 @@ impl NoteDiff {
         let balance: f64 = current.values().map(|n| n.amount).sum();
         // Round each note to sats then sum (not sum-then-round): summing exact
         // per-note integers avoids f64 accumulation error, and matches the JS
-        // SDK so both fire Balance on exactly the same data.
-        let balance_sats: i64 = current.values().map(|n| to_sats(n.amount)).sum();
+        // SDK so both fire Balance on exactly the same data. Saturating fold so
+        // hostile large amounts (each to_sats already saturates) can't overflow
+        // the i64 sum — debug panic / release wrap — matching the wallet crate.
+        let balance_sats: i64 = current
+            .values()
+            .map(|n| to_sats(n.amount))
+            .fold(0i64, i64::saturating_add);
 
         let mut events = Vec::new();
         if self.primed {
@@ -113,18 +131,16 @@ impl<'a> ShieldWatcher<'a> {
         if hash == self.last_hash {
             return Ok(vec![]);
         }
-        let min_conf = if self.opts.min_conf > 0 {
-            self.opts.min_conf
-        } else {
-            1
-        };
         let addresses = (!self.opts.addresses.is_empty()).then_some(self.opts.addresses.as_slice());
         let notes = self
             .client
             .list_shield_unspent(
-                min_conf,
+                // Sent as-is: the default is 1 (see WatchOptions), and an
+                // explicit 0 passes through — the node accepts minconf 0
+                // (include unconfirmed), same as the JS SDK.
+                self.opts.min_conf,
                 9_999_999,
-                !self.opts.exclude_watch_only,
+                self.opts.include_watch_only,
                 addresses,
             )
             .await?;
@@ -204,6 +220,17 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, ShieldEvent::Balance { .. })));
+    }
+
+    #[test]
+    fn balance_sum_saturates_without_panic() {
+        // Two notes so large that to_sats saturates each to i64::MAX; summing
+        // them must saturate, not overflow-panic (debug) or wrap (release).
+        // With a plain `.sum()` this apply() panics in a debug test build.
+        let mut diff = NoteDiff::default();
+        let events = diff.apply(vec![note("t1", 0, 1e15), note("t2", 1, 1e15)]);
+        assert!(events.is_empty()); // first apply primes silently
+        assert_eq!(diff.balance_sats, i64::MAX);
     }
 
     #[test]

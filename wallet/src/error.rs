@@ -9,9 +9,9 @@ pub enum WalletError {
     InsufficientBalance,
     /// Local scan state diverged from the node's chain (shield: commitment
     /// tree vs the block's sapling root; transparent: parent-hash mismatch).
-    /// Wallet state is stale/corrupt or the node is on another chain.
-    /// Recreate the wallet from its keys (or `reset_scan` for a transparent
-    /// wallet) and resync.
+    /// Wallet state is stale/corrupt or the node is on another chain. Recover
+    /// with the keyless `reload_from_checkpoint` (shield) or `reset_scan`
+    /// (transparent wallet) and resync — no keys required.
     #[error("scan diverged at height {height}: local {local}, node {node}")]
     ScanDiverged {
         height: i64,

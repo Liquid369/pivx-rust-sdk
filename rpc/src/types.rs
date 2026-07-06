@@ -70,9 +70,62 @@ impl ShieldRecipient {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShieldTxView {
     pub txid: String,
-    pub fee: f64,
+    /// Fee as a PIV money **string** (the node emits `FormatMoney`, e.g.
+    /// `"0.00010000"`), not a JSON number. Parse it if needed; for reliable
+    /// integer arithmetic prefer the per-entry `value_sat` fields.
+    pub fee: String,
     pub spends: Vec<ShieldTxSpend>,
     pub outputs: Vec<ShieldTxOutput>,
+}
+
+/// `value` of a shield spend/output: a PIV amount, or the node's literal
+/// string `"unknown"` when the wallet cannot recover the note amount (e.g. a
+/// spend whose creating tx has no cached note data). `value_sat` is `0` in
+/// the unknown case — check this enum before trusting a zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShieldTxValue {
+    /// Known amount in PIV.
+    Piv(f64),
+    /// The node reported `"unknown"`.
+    Unknown,
+}
+
+impl ShieldTxValue {
+    /// The PIV amount, or `None` when the node reported `"unknown"`.
+    pub fn as_piv(self) -> Option<f64> {
+        match self {
+            ShieldTxValue::Piv(v) => Some(v),
+            ShieldTxValue::Unknown => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ShieldTxValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShieldTxValue::Piv(v) => write!(f, "{v}"),
+            ShieldTxValue::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShieldTxValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Num(f64),
+            Str(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Num(n) => Ok(ShieldTxValue::Piv(n)),
+            Raw::Str(s) if s == "unknown" => Ok(ShieldTxValue::Unknown),
+            Raw::Str(s) => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&s),
+                &"a PIV amount or \"unknown\"",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,8 +135,9 @@ pub struct ShieldTxSpend {
     pub txid_prev: String,
     #[serde(rename = "outputPrev")]
     pub output_prev: u32,
+    /// Shield address, or the literal `"unknown"`.
     pub address: String,
-    pub value: f64,
+    pub value: ShieldTxValue,
     #[serde(rename = "valueSat")]
     pub value_sat: i64,
 }
@@ -92,14 +146,28 @@ pub struct ShieldTxSpend {
 pub struct ShieldTxOutput {
     pub output: u32,
     pub outgoing: bool,
+    /// Shield address, or the literal `"unknown"`.
     pub address: String,
-    pub value: f64,
+    pub value: ShieldTxValue,
     #[serde(rename = "valueSat")]
     pub value_sat: i64,
     #[serde(default)]
     pub memo: String,
     #[serde(rename = "memoStr")]
     pub memo_str: Option<String>,
+}
+
+/// Masternode counts (`getmasternodecount`). All counters are plain totals
+/// from the node's masternode manager.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MasternodeCount {
+    pub total: i64,
+    pub stable: i64,
+    pub enabled: i64,
+    pub inqueue: i64,
+    pub ipv4: i64,
+    pub ipv6: i64,
+    pub onion: i64,
 }
 
 /// Result of `importsaplingkey` / `importsaplingviewingkey`.
@@ -125,12 +193,12 @@ pub struct WalletInfo {
     pub walletname: String,
     pub walletversion: i64,
     pub balance: f64,
-    #[serde(default)]
-    pub delegated_balance: f64,
-    #[serde(default)]
-    pub cold_staking_balance: f64,
-    #[serde(default)]
-    pub shield_balance: f64,
+    /// `None` when the node omits the field — distinct from a real 0 balance.
+    pub delegated_balance: Option<f64>,
+    /// `None` when the node omits the field — distinct from a real 0 balance.
+    pub cold_staking_balance: Option<f64>,
+    /// `None` when the node omits the field — distinct from a real 0 balance.
+    pub shield_balance: Option<f64>,
     pub unconfirmed_balance: f64,
     pub immature_balance: f64,
     pub txcount: i64,

@@ -6,7 +6,9 @@ use pivx_rpc::{Auth, FromAddress, PivxClient, ShieldRecipient};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let address = args.next().expect("usage: send_shielded <shield-addr> <amount>");
+    let address = args
+        .next()
+        .expect("usage: send_shielded <shield-addr> <amount>");
     let amount: f64 = args.next().expect("missing amount").parse()?;
 
     let client = PivxClient::new(
@@ -29,7 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view = client.view_shield_transaction(&txid).await?;
     println!("fee {} PIV", view.fee);
     for output in view.outputs {
-        println!("  -> {} {} PIV memo={:?}", output.address, output.value, output.memo_str);
+        println!(
+            "  -> {} {} PIV memo={:?}",
+            output.address, output.value, output.memo_str
+        );
     }
     Ok(())
 }

@@ -165,7 +165,9 @@ broadcast relay.
 - Memos on shield recipients (validated to 512 bytes).
 - Fee is size-based (matches the node's model). By default a send that would
   leave no room for the fee is rejected rather than silently underpaying the
-  recipient; sweep semantics are opt-in (`sweep` / `subtract_fee_from_amount`).
+  recipient; sweep semantics are opt-in (`subtractFeeFromAmount` in JS, with
+  the deprecated `sweep` alias still accepted, or `subtract_fee_from_amount`
+  in Rust).
 - Amount and memo validation up front; all fee/amount arithmetic is
   overflow-checked.
 - Pending-spend tracking: notes committed to a broadcast transaction are held
@@ -257,6 +259,12 @@ ECDSA-signed legacy transactions. Amounts are integer satoshis.
   - Caller-supplied: `addUtxo(txid, vout, amount, scriptPubKey)` registers a
     UTXO you already know about (e.g. from your own indexer), returning whether
     it pays this wallet. (Rust: `add_utxo`.)
+- Script coverage is deliberately P2PKH + exchange-script only: `scanBlock`
+  and `addUtxo` credit outputs paying this wallet's keys through the standard
+  25-byte P2PKH script or the 26-byte `OP_EXCHANGEADDR` script. Bare P2PK
+  outputs and cold-staking (P2CS) outputs paying the same keys are not seen
+  and are never credited — this wallet's transaction builder could not spend
+  them anyway.
 - `balance()` totals tracked unspent value in satoshis, excluding outpoints
   reserved by `buildSend`; JS `getUtxos()` / Rust `utxos()` list all tracked
   outputs, reserved ones included. (Rust: `balance`.)

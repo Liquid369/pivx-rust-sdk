@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 
-use pivx_rpc::{Auth, Error, PivxClient};
+use pivx_rpc::{Auth, Error, PivxClient, ShieldTxValue, ShieldWatcher, WatchOptions};
 
 // PivxClient must stay Send + Sync (shared across tasks); the cookie-refresh
 // interior mutability must not regress this.
@@ -436,7 +436,7 @@ async fn send_many_wire_params_use_defaults_not_null() {
 
 #[tokio::test]
 async fn parses_get_transaction() {
-    let (url, _handle) = stub_node(vec![http(
+    let (url, handle) = stub_node(vec![http(
         "200 OK",
         r#"{"result":{"amount":-1.5,"fee":-0.0001,"confirmations":5,"txid":"tx1",
             "time":1600000000,"timereceived":1600000001,"blockhash":"bh",
@@ -445,12 +445,46 @@ async fn parses_get_transaction() {
             "hex":"aa"},"error":null,"id":0}"#,
     )]);
     let client = PivxClient::new(url, Auth::None).unwrap();
-    let tx = client.get_transaction("tx1").await.unwrap();
+    let tx = client.get_transaction("tx1", false).await.unwrap();
     assert_eq!(tx.amount, -1.5);
     assert_eq!(tx.fee, Some(-0.0001));
     assert_eq!(tx.details.len(), 1);
     assert_eq!(tx.details[0].category, "send");
     assert_eq!(tx.hex, "aa");
+    // B2 wire: include_watch_only rides on the wire (gettransaction txid, include_watchonly).
+    let request = handle.join().unwrap().remove(0);
+    assert!(
+        request.contains(r#""params":["tx1",false]"#),
+        "gettransaction must send include_watch_only: {request}"
+    );
+}
+
+#[tokio::test]
+async fn list_unspent_sends_maxconf_and_addresses() {
+    // B2 wire: min_conf, max_conf, addresses reach the wire in that positional
+    // order (rpcwallet.cpp listunspent {minconf, maxconf, addresses}).
+    let (url, handle) = stub_node(vec![
+        http("200 OK", r#"{"result":[],"error":null,"id":0}"#),
+        http("200 OK", r#"{"result":[],"error":null,"id":1}"#),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+
+    let addrs = vec!["D1".to_string(), "D2".to_string()];
+    client.list_unspent(6, 100, Some(&addrs)).await.unwrap();
+    // addresses=None trims to a trailing null → node default (all addresses).
+    client.list_unspent(1, 9_999_999, None).await.unwrap();
+
+    let requests = handle.join().unwrap();
+    assert!(
+        requests[0].contains(r#""params":[6,100,["D1","D2"]]"#),
+        "listunspent must send minconf, maxconf, addresses: {}",
+        requests[0]
+    );
+    assert!(
+        requests[1].contains(r#""params":[1,9999999]"#),
+        "addresses=None must trim to a trailing null: {}",
+        requests[1]
+    );
 }
 
 #[tokio::test]
@@ -510,6 +544,62 @@ async fn call_batch_empty_slice_is_rejected() {
     assert!(
         matches!(err, Error::Rpc { code: -32600, .. }),
         "expected invalid-request Rpc error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_batch_reordered_ids_are_attributed_by_id() {
+    // Node returns the elements out of request order (ids 1 then 0). Matching
+    // by id must still attribute each result to the correct call. (A fresh
+    // client's id counter starts at 0, so the two requests carry ids 0 and 1.)
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"[{"result":"second","error":null,"id":1},
+            {"result":42,"error":null,"id":0}]"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let results = client
+        .call_batch(&[("getblockcount", vec![]), ("getbestblockhash", vec![])])
+        .await
+        .unwrap();
+    assert_eq!(results[0].as_ref().unwrap().as_i64(), Some(42));
+    assert_eq!(results[1].as_ref().unwrap().as_str(), Some("second"));
+}
+
+#[tokio::test]
+async fn call_batch_mismatched_id_is_rejected() {
+    // The second element carries an id that matches no request (999), so
+    // request id 1 has no reply — the batch cannot be safely attributed and
+    // fails with a labeled error rather than mis-mapping by position.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"[{"result":42,"error":null,"id":0},
+            {"result":7,"error":null,"id":999}]"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let err = client
+        .call_batch(&[("getblockcount", vec![]), ("getbestblockhash", vec![])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Json { method, .. } if method == "batch"),
+        "expected labeled Json error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_batch_non_object_element_is_rejected() {
+    // A bare primitive where an object is expected must be rejected, not
+    // silently turned into Ok(Null).
+    let (url, _handle) = stub_node(vec![http("200 OK", r#"[42]"#)]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let err = client
+        .call_batch(&[("getblockcount", vec![])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Json { method, .. } if method == "batch"),
+        "expected labeled Json error, got {err:?}"
     );
 }
 
@@ -678,7 +768,8 @@ async fn cloned_client_shares_auth_state() {
     let (url, handle) = stub_node(vec![
         http("401 Unauthorized", ""), // c2 first try (stale)
         http("200 OK", r#"{"result":42,"error":null,"id":0}"#), // c2 retry (fresh)
-        http("200 OK", r#"{"result":7,"error":null,"id":0}"#), // c1 call (must be fresh)
+        // c1 call (must be fresh); id 1 — the clones share the id counter.
+        http("200 OK", r#"{"result":7,"error":null,"id":1}"#),
     ]);
     let path = temp_cookie("cloneshare", "u:old");
     let c1 = PivxClient::new(url, Auth::CookieFile(path.clone())).unwrap();
@@ -764,6 +855,226 @@ async fn import_sapling_viewing_key_wire_forms() {
     );
 }
 
+// ── Round-1 fixes: B1-B7 ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn parses_masternode_count_object() {
+    // B1: real getmasternodecount shape (src/rpc/masternode.cpp) — an object
+    // with 7 numeric fields, never a bare number.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"total":1743,"stable":1698,"enabled":1721,"inqueue":1650,
+            "ipv4":1500,"ipv6":193,"onion":50},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let c = client.get_masternode_count().await.unwrap();
+    assert_eq!(c.total, 1743);
+    assert_eq!(c.stable, 1698);
+    assert_eq!(c.enabled, 1721);
+    assert_eq!(c.inqueue, 1650);
+    assert_eq!(c.ipv4, 1500);
+    assert_eq!(c.ipv6, 193);
+    assert_eq!(c.onion, 50);
+}
+
+#[tokio::test]
+async fn masternode_count_no_tip_unknown_is_labeled_error() {
+    // B1: before the node has a chain tip, getmasternodecount returns the
+    // bare STRING "unknown" (masternode.cpp `if (!pChainTip) return
+    // "unknown";`) — surfaced as a labeled error, same contract as the JS SDK.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":"unknown","error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    match client.get_masternode_count().await.unwrap_err() {
+        Error::Rpc {
+            message, method, ..
+        } => {
+            assert!(message.contains("no chain tip"), "got: {message}");
+            assert_eq!(method, "getmasternodecount");
+        }
+        other => panic!("expected labeled Rpc error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_view_shield_transaction_string_fee_and_unknown_value() {
+    // B2: fee is a FormatMoney STRING and spend/output value can be the
+    // literal string "unknown" with valueSat 0 (rpcwallet.cpp
+    // viewshieldtransaction) — this payload mirrors a real node response.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"txid":"aa11","fee":"0.00010000",
+            "spends":[
+                {"spend":0,"txidPrev":"bb22","outputPrev":1,"address":"unknown",
+                 "value":"unknown","valueSat":0},
+                {"spend":1,"txidPrev":"cc33","outputPrev":0,
+                 "address":"ps1sender","value":1.50000000,"valueSat":150000000}],
+            "outputs":[
+                {"output":0,"outgoing":false,"address":"ps1receiver",
+                 "value":1.49990000,"valueSat":149990000,"memo":"6869","memoStr":"hi"}]},
+            "error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let v = client.view_shield_transaction("aa11").await.unwrap();
+    assert_eq!(v.fee, "0.00010000");
+    assert_eq!(v.spends[0].value, ShieldTxValue::Unknown);
+    assert_eq!(v.spends[0].value.as_piv(), None);
+    assert_eq!(v.spends[0].value_sat, 0);
+    assert_eq!(v.spends[0].address, "unknown");
+    assert_eq!(v.spends[1].value, ShieldTxValue::Piv(1.5));
+    assert_eq!(v.spends[1].value_sat, 150_000_000);
+    assert_eq!(v.outputs[0].value.as_piv(), Some(1.4999));
+    assert_eq!(v.outputs[0].memo_str.as_deref(), Some("hi"));
+}
+
+#[test]
+fn auth_debug_redacts_password() {
+    // B3: Debug must never print the RPC password.
+    let auth = Auth::UserPass {
+        user: "rpcuser".into(),
+        pass: "s3cr3t-hunter2".into(),
+    };
+    let dbg = format!("{auth:?}");
+    assert!(!dbg.contains("s3cr3t-hunter2"), "password leaked: {dbg}");
+    assert!(dbg.contains("rpcuser"), "user should stay visible: {dbg}");
+    assert!(
+        dbg.contains("<redacted>"),
+        "expected redaction marker: {dbg}"
+    );
+}
+
+#[tokio::test]
+async fn wallet_info_missing_optional_balances_are_none_not_zero() {
+    // B4: nodes/wallets that omit delegated/cold-staking/shield balances must
+    // yield None, not a fake 0.0 indistinguishable from a real zero balance.
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":{"walletname":"w","walletversion":170000,"balance":10.5,
+            "shield_balance":2.25,"unconfirmed_balance":0.0,"immature_balance":0.0,
+            "txcount":12},"error":null,"id":0}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let wi = client.get_wallet_info().await.unwrap();
+    assert_eq!(wi.balance, 10.5);
+    assert_eq!(wi.delegated_balance, None);
+    assert_eq!(wi.cold_staking_balance, None);
+    assert_eq!(wi.shield_balance, Some(2.25));
+}
+
+#[tokio::test]
+async fn mismatched_response_id_is_rejected() {
+    // B5: a success response must echo the request id (belt-and-braces
+    // against broken proxies / desynced pipelines).
+    let (url, _handle) = stub_node(vec![http(
+        "200 OK",
+        r#"{"result":42,"error":null,"id":999}"#,
+    )]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    match client.get_block_count().await.unwrap_err() {
+        Error::Json { method, source } => {
+            assert_eq!(method, "getblockcount");
+            assert!(source.to_string().contains("id"), "got: {source}");
+        }
+        other => panic!("expected Json error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn shield_watcher_default_min_conf_one_explicit_zero_passes_through() {
+    // P3: WatchOptions::default() polls with min_conf 1 — the JS SDK default —
+    // while an explicit 0 (include unconfirmed notes; the node accepts it)
+    // still reaches the wire as 0, not coerced to 1.
+    let (url, handle) = stub_node(vec![
+        http("200 OK", r#"{"result":"besthash","error":null,"id":0}"#),
+        http("200 OK", r#"{"result":[],"error":null,"id":1}"#),
+        http("200 OK", r#"{"result":"besthash2","error":null,"id":2}"#),
+        http("200 OK", r#"{"result":[],"error":null,"id":3}"#),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+
+    let mut default_watcher = ShieldWatcher::new(&client, WatchOptions::default());
+    default_watcher.poll().await.unwrap();
+
+    let mut zero_conf_watcher = ShieldWatcher::new(
+        &client,
+        WatchOptions {
+            min_conf: 0,
+            ..WatchOptions::default()
+        },
+    );
+    zero_conf_watcher.poll().await.unwrap();
+
+    let requests = handle.join().unwrap();
+    assert!(
+        requests[1].contains(r#""params":[1,9999999,true]"#),
+        "default min_conf must be sent as 1: {}",
+        requests[1]
+    );
+    assert!(
+        requests[3].contains(r#""params":[0,9999999,true]"#),
+        "explicit min_conf 0 must be sent as 0: {}",
+        requests[3]
+    );
+}
+
+#[tokio::test]
+async fn shield_watcher_watch_only_polarity() {
+    // B3: WatchOptions::default() now polls with watch-only INCLUDED (wire
+    // `true`, matching the JS `includeWatchOnly` default); an explicit
+    // include_watch_only=false excludes it (wire `false`).
+    let (url, handle) = stub_node(vec![
+        http("200 OK", r#"{"result":"besthash","error":null,"id":0}"#),
+        http("200 OK", r#"{"result":[],"error":null,"id":1}"#),
+        http("200 OK", r#"{"result":"besthash2","error":null,"id":2}"#),
+        http("200 OK", r#"{"result":[],"error":null,"id":3}"#),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+
+    let mut default_watcher = ShieldWatcher::new(&client, WatchOptions::default());
+    default_watcher.poll().await.unwrap();
+
+    let mut exclude_watcher = ShieldWatcher::new(
+        &client,
+        WatchOptions {
+            include_watch_only: false,
+            ..WatchOptions::default()
+        },
+    );
+    exclude_watcher.poll().await.unwrap();
+
+    let requests = handle.join().unwrap();
+    assert!(
+        requests[1].contains(r#""params":[1,9999999,true]"#),
+        "default must include watch-only (wire true): {}",
+        requests[1]
+    );
+    assert!(
+        requests[3].contains(r#""params":[1,9999999,false]"#),
+        "include_watch_only=false must exclude watch-only (wire false): {}",
+        requests[3]
+    );
+}
+
+#[test]
+fn credentials_in_url_are_rejected() {
+    // B7: URL userinfo is unsupported — reject at construction with a clear
+    // error pointing at Auth, before anything can log the URL.
+    let err = PivxClient::new("http://user:pass@127.0.0.1:51473".to_string(), Auth::None).err();
+    assert!(
+        matches!(err, Some(Error::CredentialsInUrl)),
+        "user:pass@ must be rejected, got {err:?}"
+    );
+    let err = PivxClient::new("http://user@127.0.0.1:51473".to_string(), Auth::None).err();
+    assert!(
+        matches!(err, Some(Error::CredentialsInUrl)),
+        "user-only userinfo must be rejected, got {err:?}"
+    );
+    // A clean URL still constructs.
+    assert!(PivxClient::new("http://127.0.0.1:51473".to_string(), Auth::None).is_ok());
+}
+
 #[tokio::test]
 async fn protx_list_method_name_and_defaults_not_null() {
     let (url, handle) = stub_node(vec![http("200 OK", r#"{"result":[],"error":null,"id":0}"#)]);
@@ -782,5 +1093,109 @@ async fn protx_list_method_name_and_defaults_not_null() {
     assert!(
         request.contains(r#""params":[true,false,false,200000]"#),
         "protx_list must send node defaults, no interior null: {request}"
+    );
+}
+
+/// Like `stub_node` but sleeps `delay` before answering each connection, and
+/// tolerates the client hanging up early (a timed-out request).
+fn slow_stub_node(
+    delay: std::time::Duration,
+    responses: Vec<String>,
+) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(delay);
+            let _ = stream.write_all(response.as_bytes()); // client may have timed out
+        }
+    });
+    (url, handle)
+}
+
+#[tokio::test]
+async fn sapling_import_rescan_outlives_short_client_timeout() {
+    // P1: a rescan blocks the node well past any sane client timeout, so both
+    // sapling imports get a per-request timeout of max(client timeout, 600s)
+    // unless rescan == Some("no") — mirroring the JS SDK. The stub answers
+    // after 600ms against a 200ms client timeout.
+    let (url, _handle) = slow_stub_node(
+        std::time::Duration::from_millis(600),
+        vec![
+            http(
+                "200 OK",
+                r#"{"result":{"address":"ps1"},"error":null,"id":0}"#,
+            ),
+            http(
+                "200 OK",
+                r#"{"result":{"address":"ps1"},"error":null,"id":1}"#,
+            ),
+            // Served to the rescan="no" call below, which times out first: the
+            // stub must still accept its connection, otherwise the client sees
+            // a connection refusal instead of its own (short) timeout.
+            http(
+                "200 OK",
+                r#"{"result":{"address":"ps1"},"error":null,"id":2}"#,
+            ),
+        ],
+    );
+    let client =
+        PivxClient::with_timeout(url, Auth::None, std::time::Duration::from_millis(200)).unwrap();
+
+    // Default rescan ("whenkeyisnew") → raised timeout: the call succeeds.
+    let imported = client.import_sapling_key("skey", None, None).await.unwrap();
+    assert_eq!(imported.address, "ps1");
+    // Explicit rescan="yes" on the viewing-key import: same raised timeout.
+    let imported = client
+        .import_sapling_viewing_key("vk", Some("yes"), None)
+        .await
+        .unwrap();
+    assert_eq!(imported.address, "ps1");
+    // rescan="no" keeps the client-wide (short) timeout: times out.
+    let err = client
+        .import_sapling_key("skey", Some("no"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Transport(e) if e.is_timeout()),
+        "rescan=\"no\" must keep the short client timeout, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn raw_shield_send_many_min_conf_fee_defaults_and_pass_through() {
+    // P5: omitted min_conf/fee become the node defaults on the wire (1, and
+    // fee=0 = "node computes the minimum"), never interior nulls; explicit
+    // values pass through — matching the JS SDK's rawShieldSendMany.
+    let (url, handle) = stub_node(vec![
+        http("200 OK", r#"{"result":"rawhex","error":null,"id":0}"#),
+        http("200 OK", r#"{"result":"rawhex","error":null,"id":1}"#),
+    ]);
+    let client = PivxClient::new(url, Auth::None).unwrap();
+    let recipients = [pivx_rpc::ShieldRecipient::new("ps1x", 1.0)];
+
+    let hex = client
+        .raw_shield_send_many("from_shield", &recipients, None, None)
+        .await
+        .unwrap();
+    assert_eq!(hex, "rawhex");
+    client
+        .raw_shield_send_many("from_shield", &recipients, Some(5), Some(0.5))
+        .await
+        .unwrap();
+
+    let requests = handle.join().unwrap();
+    assert!(
+        requests[0].contains(r#""params":["from_shield",[{"address":"ps1x","amount":1.0}],1,0.0]"#),
+        "omitted min_conf/fee must become node defaults 1/0: {}",
+        requests[0]
+    );
+    assert!(
+        requests[1].contains(r#""params":["from_shield",[{"address":"ps1x","amount":1.0}],5,0.5]"#),
+        "explicit min_conf/fee must pass through: {}",
+        requests[1]
     );
 }

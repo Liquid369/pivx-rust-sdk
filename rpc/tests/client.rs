@@ -1090,8 +1090,23 @@ fn credentials_in_url_are_rejected() {
         matches!(err, Some(Error::CredentialsInUrl)),
         "user-only userinfo must be rejected, got {err:?}"
     );
+    // S5: a scheme-less "user:pass@host:port" parses with "user" as the URL
+    // scheme, so the userinfo check never sees the credentials; without the
+    // scheme guard reqwest would fail at send time and leak the password
+    // through its error. Reject it at construction instead.
+    let err = PivxClient::new("user:pass@127.0.0.1:51473".to_string(), Auth::None).err();
+    assert!(
+        matches!(err, Some(Error::CredentialsInUrl)),
+        "scheme-less user:pass@host must be rejected, got {err:?}"
+    );
+    // A non-http(s) scheme is likewise refused (only http/https are supported).
+    assert!(matches!(
+        PivxClient::new("ftp://127.0.0.1:51473".to_string(), Auth::None),
+        Err(Error::CredentialsInUrl)
+    ));
     // A clean URL still constructs.
     assert!(PivxClient::new("http://127.0.0.1:51473".to_string(), Auth::None).is_ok());
+    assert!(PivxClient::new("https://127.0.0.1:51473".to_string(), Auth::None).is_ok());
 }
 
 #[tokio::test]

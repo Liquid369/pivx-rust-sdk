@@ -1,6 +1,6 @@
 [package]
 name = "pivx-wallet"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source."

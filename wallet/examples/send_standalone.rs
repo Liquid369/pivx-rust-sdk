@@ -1,16 +1,21 @@
 //! Fully standalone shielded send: keys and proving live in this process;
 //! the node only supplies blocks and relays the final transaction.
-//! Usage: PIVX_RPC_USER=u PIVX_RPC_PASS=p cargo run --release --example send_standalone -- <spending-key> <birth-height> <to> <piv>
+//! Usage: PIVX_SPENDING_KEY=<key> PIVX_RPC_USER=u PIVX_RPC_PASS=p \
+//!   cargo run --release --example send_standalone -- <birth-height> <to> <piv>
+//!
+//! SECURITY: the spending key is read from PIVX_SPENDING_KEY and must NEVER be
+//! passed on the command line — argv is exposed via shell history, `ps`, and CI
+//! logs. This example uses a plain env var for brevity; a real deployment should
+//! source the key from a secret manager and scope it to this process only.
 
 use pivx_rpc::{Auth, PivxClient};
 use pivx_wallet::{Network, SendOptions, ShieldWallet};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let spending_key = std::env::var("PIVX_SPENDING_KEY")
+        .expect("set PIVX_SPENDING_KEY (never pass a spending key in argv)");
     let mut args = std::env::args().skip(1);
-    let spending_key = args
-        .next()
-        .expect("usage: send_standalone <spending-key> <birth-height> <to> <piv>");
     let birth_height: i64 = args.next().expect("missing birth height").parse()?;
     let to = args.next().expect("missing recipient");
     let piv: f64 = args.next().expect("missing amount").parse()?;

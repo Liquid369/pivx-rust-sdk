@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-07-09
+
+Security hardening from a full wallet security review (no Critical/High found;
+deterministic RFC6979/low-S signing and no spend authority in persisted state
+verified sound, including a live-mainnet transaction).
+
+### Fixed
+
+- `pivx-rpc`: a scheme-less `user:pass@host` URL (which `Url::parse` accepts
+  with `user` as the scheme, hiding the credentials) is now rejected at
+  construction, so the password can no longer surface in a reqwest transport
+  error.
+- `pivx-wallet`: `Utxo` no longer derives `Serialize`/`Deserialize`, so its raw
+  `private_key` can't be accidentally serialized by an integrator (the SDK
+  never persists it).
+
+### Security
+
+- Dependency advisories cleared: updated transitive crates (`bytes`, `time`,
+  `rustls-webpki`, `crossbeam-epoch`) to resolve seven RustSec advisories; no
+  source or public-API change.
+- Examples read the spending key from an environment variable instead of argv.
+- SECURITY.md documents the trusted-node transparent-sighash caveat (a
+  malicious node can misreport an input amount; being addressed by v3
+  amount-committing signatures), the absence of in-memory secret scrubbing,
+  and WASM provenance.
+
 ## [0.7.1] - 2026-07-06
 
 Patch from a post-publish audit: `pivx-rpc` 0.7.1, `pivx-wallet` 0.7.1.

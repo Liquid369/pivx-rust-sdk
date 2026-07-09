@@ -157,11 +157,21 @@ impl PivxClient {
     ) -> Result<Self> {
         let url = url.into();
         // Reject URL userinfo up front: it is not sent as basic auth by this
-        // client, and a URL with a password in it leaks into logs/errors.
-        if let Ok(parsed) = reqwest::Url::parse(&url) {
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                return Err(Error::CredentialsInUrl);
+        // client, and a URL with a password in it leaks into logs/errors. Also
+        // require an http(s) scheme: a scheme-less "user:pass@host:port" parses
+        // with "user" as the scheme, hiding the credentials from the userinfo
+        // check, and reqwest would then leak the password through its send-time
+        // error. An unparseable URL is rejected for the same reason.
+        match reqwest::Url::parse(&url) {
+            Ok(parsed) => {
+                if !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || (parsed.scheme() != "http" && parsed.scheme() != "https")
+                {
+                    return Err(Error::CredentialsInUrl);
+                }
             }
+            Err(_) => return Err(Error::CredentialsInUrl),
         }
         let (auth, cookie_path) = match auth {
             Auth::None => (None, None),

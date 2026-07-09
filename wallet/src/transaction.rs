@@ -306,8 +306,11 @@ pub struct BuiltTransaction {
     pub nullifiers: Vec<String>,
 }
 
-/// Transparent UTXO used as input when shielding funds.
-#[derive(Clone, Serialize, Deserialize)]
+/// Transparent UTXO used as input when shielding funds. Caller-constructed and
+/// never persisted by the SDK (not part of `WalletState`), so it deliberately
+/// does not derive `Serialize`/`Deserialize`: a raw `private_key: Vec<u8>` must
+/// not be serializable by accident.
+#[derive(Clone)]
 pub struct Utxo {
     pub txid: String,
     pub vout: u32,

@@ -136,6 +136,39 @@ JS SDK loads its WASM build, the Rust SDK vendors the same core natively.
 Sapling proving parameters are SHA-256-pinned against known digests
 regardless of download source.
 
+## Known limitations
+
+These are properties the SDK does **not** yet provide. They are documented so
+integrators do not assume protection that is not there.
+
+- **Transparent sends trust the node's reported input amounts.** PIVX's legacy
+  transparent sighash (the non-Sapling `SignatureHash` path in
+  `src/script/interpreter.cpp`, built by `CTransactionSignatureSerializer`)
+  does **not** commit the value of the input being signed, unlike the Sapling
+  sighash, which hashes the input `amount` directly. A malicious node that
+  under-reports a transparent UTXO's value can therefore make the wallet sign a
+  send that spends more than intended, burning the difference as miner fee.
+  Only the transparent-input path is affected — the shielded (Sapling) path
+  commits input values and is immune. This is being addressed by moving
+  transparent sends to amount-committing v3 signatures; until then, point
+  transparent sends at a trusted or self-operated node (see *Integrator
+  requirements*).
+
+- **Secrets are not scrubbed from memory.** Neither SDK zeroizes key material
+  after use: the JS runtime offers no reliable way to wipe a string or buffer,
+  and the Rust SDK does not currently use `zeroize`. Spending keys, seeds, and
+  viewing keys may persist in process memory — and in swap or a core dump —
+  until reclaimed by the allocator or garbage collector. Treat the whole
+  process as sensitive: avoid core dumps, disable swap for the signer, and keep
+  each key's in-process lifetime short.
+
+- **WASM crypto is a prebuilt binary artifact.** The JS SDK's shielded
+  cryptography runs prebuilt WebAssembly from `pivx-shield-rust`, now pinned to
+  an exact version (`1.4.0`) rather than a version range. Integrators should
+  lock their full dependency tree (commit the lockfile) and, for high-assurance
+  deployments, verify the published WASM artifact's hash against a build they
+  trust.
+
 ## Reporting
 
 Report vulnerabilities in this SDK privately — email

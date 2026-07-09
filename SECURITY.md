@@ -73,6 +73,15 @@ PoS/header validation, a node that lies self-consistently is believed.
   (`subtractFeeFromAmount` in JS — the deprecated `sweep` alias still works —
   or `subtract_fee_from_amount` in Rust). For exact payouts, leave fee
   headroom (a typical shield spend costs ~0.024 PIV).
+- **Transparent sends commit the input amount in the signature.** Transparent
+  spends are built as Sapling-version (v3) transactions and signed with the
+  `SIGVERSION_SAPLING` sighash (`src/script/interpreter.cpp`), which hashes the
+  value of the input being signed directly into the preimage. If a node under-
+  or over-reports a UTXO's value, the resulting signature is invalid and the
+  network rejects the transaction, so the wallet cannot be tricked into spending
+  more than intended and burning the difference as miner fee. This closes the
+  gap in PIVX's legacy (non-Sapling) transparent sighash, which omitted the
+  amount.
 - **Dust notes are purged on scan, not spent.** A note worth no more than its
   own input fee is never selected for spending, and each scan pass drops such
   notes from tracked state, so an attacker cannot freeze withdrawals or bloat
@@ -140,19 +149,6 @@ regardless of download source.
 
 These are properties the SDK does **not** yet provide. They are documented so
 integrators do not assume protection that is not there.
-
-- **Transparent sends trust the node's reported input amounts.** PIVX's legacy
-  transparent sighash (the non-Sapling `SignatureHash` path in
-  `src/script/interpreter.cpp`, built by `CTransactionSignatureSerializer`)
-  does **not** commit the value of the input being signed, unlike the Sapling
-  sighash, which hashes the input `amount` directly. A malicious node that
-  under-reports a transparent UTXO's value can therefore make the wallet sign a
-  send that spends more than intended, burning the difference as miner fee.
-  Only the transparent-input path is affected — the shielded (Sapling) path
-  commits input values and is immune. This is being addressed by moving
-  transparent sends to amount-committing v3 signatures; until then, point
-  transparent sends at a trusted or self-operated node (see *Integrator
-  requirements*).
 
 - **Secrets are not scrubbed from memory.** Neither SDK zeroizes key material
   after use: the JS runtime offers no reliable way to wipe a string or buffer,

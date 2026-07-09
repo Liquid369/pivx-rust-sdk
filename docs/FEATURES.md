@@ -222,8 +222,9 @@ broadcast relay.
 
 A standalone HD wallet for PIVX's transparent (non-shielded, UTXO) funds —
 the transparent counterpart to the shield wallet above, built from the same
-kind of seed. No proving parameters are involved: transparent sends are plain
-ECDSA-signed legacy transactions. Amounts are integer satoshis.
+kind of seed. No proving parameters are involved: transparent sends are
+ECDSA-signed Sapling-version (v3) transactions whose signatures commit the
+input amount. Amounts are integer satoshis.
 
 ### Addressing and keys
 
@@ -273,7 +274,7 @@ ECDSA-signed legacy transactions. Amounts are integer satoshis.
 ### Sending
 
 - `buildSend(to, amount, feePerByte)` selects UTXOs largest-first, builds and
-  ECDSA-signs a legacy (v1) transaction, and sends change to a fresh internal
+  ECDSA-signs an amount-committing Sapling-version (v3) transaction, and sends change to a fresh internal
   change address. It returns the raw tx hex and the list of spent outputs
   (`{ hex, spent }`; Rust: `build_send` → `(hex, spent)`). `feePerByte`
   defaults to 100 sats/byte and the fee is size-based; amounts are satoshis.

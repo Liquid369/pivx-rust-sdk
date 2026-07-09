@@ -549,8 +549,9 @@ nothing else exercises consensus acceptance of locally-built transactions.
 ## Transparent wallet
 
 `pivx-wallet` also manages PIVX's transparent (non-shielded, UTXO) funds,
-separately from the shield wallet. Transparent sends are plain ECDSA-signed
-legacy transactions — no proving parameters. Amounts are integer satoshis,
+separately from the shield wallet. Transparent sends are ECDSA-signed
+Sapling-version (v3) transactions whose signatures commit the input amount —
+no proving parameters. Amounts are integer satoshis,
 same as the shield wallet.
 
 ### Addressing

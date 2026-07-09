@@ -563,8 +563,10 @@ impl TransparentWallet {
     /// Estimated tx size (bytes) for `n_in` P2PKH inputs and `out_bytes` of
     /// serialized outputs (summed via [`output_size`](Self::output_size)).
     fn est_size(n_in: usize, out_bytes: u64) -> u64 {
-        // +2: the input-count varint grows from 1 to 3 bytes at 253 inputs.
-        (n_in as u64) * 148 + out_bytes + 10 + if n_in >= 253 { 2 } else { 0 }
+        // Base 85 = nVersion(2) + nType(2) + vin count(1) + vout count(1) +
+        // nLockTime(4) + empty v3 sapData(75). +2: the input-count varint grows
+        // from 1 to 3 bytes at 253 inputs.
+        (n_in as u64) * 148 + out_bytes + 85 + if n_in >= 253 { 2 } else { 0 }
     }
 
     /// Build and sign a transparent send of `amount` sats to `to`, selecting
@@ -1023,10 +1025,28 @@ mod tests {
         // Send half; expect a valid tx and one input selected.
         let dest = p2pkh_address(&other.public_key, MainNetwork);
         let (hex, spent) = w.build_send(&dest, 100_000_000, Some(100)).unwrap();
-        assert!(hex.starts_with("01000000"));
+        assert!(hex.starts_with("03000000")); // nVersion=3 (SAPLING), nType=0
         assert_eq!(spent.len(), 1);
         w.mark_spent(&spent);
         assert_eq!(w.balance(), 0);
+    }
+
+    /// Cross-SDK v3 fixture end-to-end: build_send must reproduce, byte-for-byte,
+    /// the tx that `transparent_tx::tests::cross_sdk_v3_fixture` builds by hand
+    /// (and that the JS SDK / a regtest node accept). seed=[7;32], TestNetwork,
+    /// one 1 PIV input aa..aa:0 on the first address, send 0.9 PIV to that first
+    /// address, fee_per_byte 100.
+    #[test]
+    fn cross_sdk_v3_send_fixture() {
+        use pivx_primitives::consensus::Network::TestNetwork;
+        let seed = [7u8; 32];
+        let mut w = TransparentWallet::new(&seed, TestNetwork, 0, 20).unwrap();
+        let a0 = derive_key(&seed, TestNetwork, 0, 0, 0).unwrap();
+        let addr = a0.address();
+        assert!(w.add_utxo(&"aa".repeat(32), 0, 100_000_000, spk(&addr)));
+        let (hex, spent) = w.build_send(&addr, 90_000_000, Some(100)).unwrap();
+        assert_eq!(spent, vec![("aa".repeat(32), 0)]);
+        assert_eq!(hex, crate::transparent_tx::tests::FIXTURE_TX_HEX);
     }
 
     #[test]
@@ -1176,7 +1196,7 @@ mod tests {
         // Spending exchange-script UTXOs builds a valid tx.
         let dest = p2pkh_address(&a0.public_key, MainNetwork);
         let (hex, spent) = w.build_send(&dest, 250_000_000, Some(100)).unwrap();
-        assert!(hex.starts_with("01000000"));
+        assert!(hex.starts_with("03000000")); // nVersion=3 (SAPLING), nType=0
         assert_eq!(spent.len(), 2);
     }
 
@@ -2101,8 +2121,10 @@ mod tests {
             };
             let (hex, _) = w.build_send(&to, 100_000_000, Some(10)).unwrap();
             let bytes = hex::decode(&hex).unwrap();
-            // The change output is last: [8-byte value][0x19 scriptlen][25 script][4 locktime].
-            let off = bytes.len() - 38;
+            // Change output is the last vout, before the 4-byte locktime and the
+            // 75-byte empty v3 sapData trailer:
+            // [8-byte value][0x19 scriptlen][25 script][4 locktime][75 sapData].
+            let off = bytes.len() - 38 - 75;
             assert_eq!(bytes[off + 8], 0x19, "last output is 25-byte P2PKH change");
             u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
         };

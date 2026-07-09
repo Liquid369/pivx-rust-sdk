@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-07-09
+
+Transparent sends now use PIVX's Sapling-version (v3) sighash
+(`SIGVERSION_SAPLING`), which commits the input amount in every signature.
+The legacy (v1) sighash they used before omitted the amount, so a node that
+under-reported a UTXO's value could make the wallet sign a send that spent more
+than intended and burned the difference as miner fee. The v3 transaction is an
+ordinary transparent tx with an empty Sapling data block; it was validated on
+regtest and mainnet (single-input, multi-input, and exchange-address inputs all
+accepted by a live node) and builds byte-identically in the JS and Rust SDKs.
+
+### Changed
+
+- `pivx-wallet`: transparent `build_send` now produces nVersion=3 (Sapling)
+  transactions signed with the amount-committing `SIGVERSION_SAPLING` sighash.
+  The serialized tx gains a 75-byte empty Sapling-data trailer; the fee-size
+  estimate was raised to match so the 100 kB standard-tx cap and the 10
+  sat/byte relay floor stay conservative.
+
+### Security
+
+- Closes the transparent-sighash amount-omission gap (S1): the signature is now
+  invalid if a node misreports an input value, so it can no longer trick the
+  wallet into burning funds as fee. Only the transparent path was affected; the
+  shielded path already committed values. See SECURITY.md.
+
 ## [0.7.2] - 2026-07-09
 
 Security hardening from a full wallet security review (no Critical/High found;

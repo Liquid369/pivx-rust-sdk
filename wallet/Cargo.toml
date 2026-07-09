@@ -1,6 +1,6 @@
 [package]
 name = "pivx-wallet"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 rust-version = "1.85"
 description = "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source."
@@ -34,6 +34,9 @@ zcash_transparent = { git = "https://github.com/Duddino/librustpivx", rev = "0cb
 sapling = { git = "https://github.com/Duddino/librustpivx", rev = "0cbf7b895d1644a0152bb5f523eb88078a10ce3a" }
 
 incrementalmerkletree = "0.7"
+# BLAKE2b for the sapling (v3) transparent sighash (16-byte personalization);
+# already in the tree via librustpivx, pinned to the locked version.
+blake2b_simd = "1.0.3"
 secp256k1 = { version = "0.29.1", features = ["rand"] }
 either = "1.13.0"
 rand_core = "0.6.4"

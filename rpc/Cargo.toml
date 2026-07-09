@@ -1,6 +1,6 @@
 [package]
 name = "pivx-rpc"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 rust-version = "1.85"
 description = "PIVX SDK: typed JSON-RPC client with shielded (SHIELD/Sapling) balance watching and transaction support"
